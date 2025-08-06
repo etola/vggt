@@ -149,6 +149,26 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
             model, images_for_model, dtype, vggt_model_resolution
         )
         
+        # --- Save Combined Batch Point Cloud ---
+        # Flatten all points, confidences, and colors from the batch
+        batch_points_flat = points_3d_batch.reshape(-1, 3)
+        batch_conf_flat = depth_conf_batch.flatten()
+        batch_colors_np = images_for_color.permute(0, 2, 3, 1).numpy()
+        batch_colors_flat = (batch_colors_np.reshape(-1, 3) * 255).astype(np.uint8)
+
+        # Filter the combined points
+        combined_conf_mask = batch_conf_flat > args.conf_threshold
+        combined_filtered_points = batch_points_flat[combined_conf_mask]
+        combined_filtered_colors = batch_colors_flat[combined_conf_mask]
+
+        # Save the combined point cloud
+        combined_ply_path = os.path.join(ply_output_dir, f"batch_{batch_idx:03d}_combined.ply")
+        if combined_filtered_points.shape[0] > 0:
+            combined_pc = trimesh.PointCloud(vertices=combined_filtered_points, colors=combined_filtered_colors)
+            combined_pc.export(combined_ply_path)
+            print(f"  Saved combined batch with {combined_filtered_points.shape[0]} points to {combined_ply_path}")
+        
+        # --- Save Individual Frame Outputs ---
         # Save one point cloud and one depth map per frame in the batch
         for i in range(len(batch_paths)):
             base_name = os.path.basename(batch_paths[i])
