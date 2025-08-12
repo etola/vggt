@@ -1,4 +1,5 @@
 .hydra/
+.vscode/
 output/
 ckpt/
 # Byte-compiled / optimized / DLL files
