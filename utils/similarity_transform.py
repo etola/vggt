@@ -207,9 +207,10 @@ def robust_similarity_transform_3d(points_src, points_dst, outlier_threshold=2.0
     return final_result
 
 
-def compute_similarity_transform(vggt_sparse_dir, colmap_sparse_dir, verbose=True, use_robust=False):
+def compute_similarity_transform(source_sparse_dir, target_sparse_dir, verbose=True, use_robust=False):
     """
-    Compute similarity transform between VGGT and COLMAP reconstructions.
+    Compute similarity transform between source and target reconstructions.
+    Transform source reconstruction to target coordinate system.
     
     Args:
         vggt_sparse_dir: Path to VGGT sparse reconstruction directory
@@ -224,38 +225,38 @@ def compute_similarity_transform(vggt_sparse_dir, colmap_sparse_dir, verbose=Tru
         print("Loading reconstructions...")
     
     # Load reconstructions
-    vggt_reconstruction = load_reconstruction(vggt_sparse_dir)
-    if vggt_reconstruction is None:
-        raise ValueError(f"Failed to load VGGT reconstruction from {vggt_sparse_dir}")
+    source_reconstruction = load_reconstruction(source_sparse_dir)
+    if source_reconstruction is None:
+        raise ValueError(f"Failed to load VGGT reconstruction from {source_sparse_dir}")
     
-    colmap_reconstruction = load_reconstruction(colmap_sparse_dir)
-    if colmap_reconstruction is None:
-        raise ValueError(f"Failed to load COLMAP reconstruction from {colmap_sparse_dir}")
+    target_reconstruction = load_reconstruction(target_sparse_dir)
+    if target_reconstruction is None:
+        raise ValueError(f"Failed to load COLMAP reconstruction from {target_sparse_dir}")
     
     if verbose:
         print("Extracting camera poses...")
     
     # Extract poses
-    vggt_poses = extract_camera_poses(vggt_reconstruction)
-    colmap_poses = extract_camera_poses(colmap_reconstruction)
+    source_poses = extract_camera_poses(source_reconstruction)
+    target_poses = extract_camera_poses(target_reconstruction)
     
     if verbose:
-        print(f"VGGT reconstruction: {len(vggt_poses)} images")
-        print(f"COLMAP reconstruction: {len(colmap_poses)} images")
+        print(f"Source reconstruction: {len(source_poses)} images")
+        print(f"Target reconstruction: {len(target_poses)} images")
     
     # Find common images
-    common_names = find_common_images(vggt_poses, colmap_poses)
+    common_names = find_common_images(source_poses, target_poses)
     
     # Extract positions for common images
-    vggt_common_positions = np.array([vggt_poses[name]['position'] for name in common_names])
-    colmap_common_positions = np.array([colmap_poses[name]['position'] for name in common_names])
+    source_common_positions = np.array([source_poses[name]['position'] for name in common_names])
+    target_common_positions = np.array([target_poses[name]['position'] for name in common_names])
     
     if verbose:
         print("Computing similarity transform...")
     
     # Compute similarity transform
     if use_robust:
-        transform_result = robust_similarity_transform_3d(vggt_common_positions, colmap_common_positions)
+        transform_result = robust_similarity_transform_3d(source_common_positions, target_common_positions)
         if verbose:
             print(f"Robust Similarity Transform Results:")
             print(f"  Scale: {transform_result['scale']:.6f}")
@@ -266,7 +267,7 @@ def compute_similarity_transform(vggt_sparse_dir, colmap_sparse_dir, verbose=Tru
             print(f"  RMSE (inliers only): {transform_result.get('robust_rmse', transform_result['rmse']):.6f}")
             print(f"  RMSE (all points): {transform_result.get('all_points_rmse', transform_result['rmse']):.6f}")
     else:
-        transform_result = similarity_transform_3d(vggt_common_positions, colmap_common_positions)
+        transform_result = similarity_transform_3d(source_common_positions, target_common_positions)
         if verbose:
             print(f"Similarity Transform Results:")
             print(f"  Scale: {transform_result['scale']:.6f}")
