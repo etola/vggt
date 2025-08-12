@@ -124,58 +124,31 @@ def convert_colmap_intrinsics_to_vggt_format(colmap_intrinsic, depth_width, dept
         orig_width = orig_height = 2048  # Common camera resolution
         print(f"⚠️  Original image not found, assuming {orig_width}x{orig_height}")
     
-    # Check if intrinsics are normalized (typical signs: fx/fy around 1.0, cx/cy around 0.0)
-    if abs(fx_colmap - 1.0) < 0.1 and abs(fy_colmap - 1.0) < 0.1:
-        print("⚠️  Detected normalized intrinsics, converting to pixel space...")
+    # Intrinsics appear to be in pixel space already
+    # Check if they're for the original image resolution or depth map resolution
+    # VGGT intrinsics for 518x518 are typically around 850-900 pixels focal length
+    if fx_colmap > depth_width * 2.0:  # Likely for original image (much larger than depth map)
+        print("⚠️  Intrinsics appear to be for original image, scaling to depth map resolution...")
         
-        # For normalized intrinsics, we need to scale them to the depth map resolution
-        # Normalized intrinsics assume focal length of 1.0 for a "unit" image
-        # We need to scale this to actual pixel focal lengths for the depth map resolution
-        
-        # Calculate scale factors from original image to depth map
+        # Scale from original image to depth map resolution
         scale_x = depth_width / orig_width
         scale_y = depth_height / orig_height
         
+        fx_vggt = fx_colmap * scale_x
+        fy_vggt = fy_colmap * scale_y
+        cx_vggt = cx_colmap * scale_x if cx_colmap > 0 else depth_width / 2.0
+        cy_vggt = cy_colmap * scale_y if cy_colmap > 0 else depth_height / 2.0
+        
         print(f"📐 Scale factors: x={scale_x:.6f}, y={scale_y:.6f}")
-        
-        # Estimate reasonable focal lengths for the original image
-        # Based on analysis of actual VGGT intrinsics, focal lengths are typically ~1.66x image dimensions
-        fx_orig_estimate = orig_width * 1.66  # Corresponds to ~35° horizontal FOV
-        fy_orig_estimate = orig_height * 1.65  # Corresponds to ~35° vertical FOV
-        
-        # Scale to depth map resolution  
-        fx_vggt = fx_orig_estimate * scale_x
-        fy_vggt = fy_orig_estimate * scale_y
-        cx_vggt = depth_width / 2.0
-        cy_vggt = depth_height / 2.0
-        
-        print(f"🔧 Converted to VGGT format: fx={fx_vggt:.6f}, fy={fy_vggt:.6f}, cx={cx_vggt:.6f}, cy={cy_vggt:.6f}")
+        print(f"🔧 Scaled to depth map resolution: fx={fx_vggt:.6f}, fy={fy_vggt:.6f}, cx={cx_vggt:.6f}, cy={cy_vggt:.6f}")
     else:
-        # Intrinsics appear to be in pixel space already
-        # Check if they're for the original image resolution or depth map resolution
-        # VGGT intrinsics for 518x518 are typically around 850-900 pixels focal length
-        if fx_colmap > depth_width * 2.0:  # Likely for original image (much larger than depth map)
-            print("⚠️  Intrinsics appear to be for original image, scaling to depth map resolution...")
-            
-            # Scale from original image to depth map resolution
-            scale_x = depth_width / orig_width
-            scale_y = depth_height / orig_height
-            
-            fx_vggt = fx_colmap * scale_x
-            fy_vggt = fy_colmap * scale_y
-            cx_vggt = cx_colmap * scale_x if cx_colmap > 0 else depth_width / 2.0
-            cy_vggt = cy_colmap * scale_y if cy_colmap > 0 else depth_height / 2.0
-            
-            print(f"📐 Scale factors: x={scale_x:.6f}, y={scale_y:.6f}")
-            print(f"🔧 Scaled to depth map resolution: fx={fx_vggt:.6f}, fy={fy_vggt:.6f}, cx={cx_vggt:.6f}, cy={cy_vggt:.6f}")
-        else:
-            # Already at depth map resolution (VGGT intrinsics are typically 800-900 for 518x518)
-            fx_vggt = fx_colmap
-            fy_vggt = fy_colmap
-            cx_vggt = cx_colmap if cx_colmap > 0 else depth_width / 2.0
-            cy_vggt = cy_colmap if cy_colmap > 0 else depth_height / 2.0
-            
-            print(f"✅ Using COLMAP intrinsics as-is (already at depth map resolution): fx={fx_vggt:.6f}, fy={fy_vggt:.6f}, cx={cx_vggt:.6f}, cy={cy_vggt:.6f}")
+        # Already at depth map resolution (VGGT intrinsics are typically 800-900 for 518x518)
+        fx_vggt = fx_colmap
+        fy_vggt = fy_colmap
+        cx_vggt = cx_colmap if cx_colmap > 0 else depth_width / 2.0
+        cy_vggt = cy_colmap if cy_colmap > 0 else depth_height / 2.0
+        
+        print(f"✅ Using COLMAP intrinsics as-is (already at depth map resolution): fx={fx_vggt:.6f}, fy={fy_vggt:.6f}, cx={cx_vggt:.6f}, cy={cy_vggt:.6f}")
     
     # Construct VGGT-format intrinsic matrix
     vggt_intrinsic = np.array([
