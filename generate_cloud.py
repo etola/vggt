@@ -20,12 +20,12 @@ def parse_arguments():
                        help="Index of the image to generate point cloud for (0-based)")
     parser.add_argument("--conf_threshold", type=float, default=2.0,
                        help="Confidence threshold for filtering points (default: 2.0)")
-    parser.add_argument("--output_dir", type=str, default=None,
+    parser.add_argument("--output_dir", type=str, default="pointclouds",
                        help="Output directory for point cloud (default: scene_dir/pointclouds)")
     parser.add_argument("--vggt_model_resolution", type=int, default=518,
                        help="VGGT model resolution (default: 518)")
-    parser.add_argument("--data_subdir", type=str, default="out_clean",
-                       help="Subdirectory containing vggt data (default: out_clean)")
+    parser.add_argument("--data_subdir", type=str, default="vggt",
+                       help="Subdirectory containing vggt data (default: vggt)")
     parser.add_argument("--use_colmap", action="store_true", default=False,
                        help="Use COLMAP calibration instead of individual camera parameters")
     parser.add_argument("--colmap_subdir", type=str, default="colmap_calibration/batch_000",
@@ -187,8 +187,8 @@ def convert_colmap_intrinsics_to_vggt_format(colmap_intrinsic, depth_width, dept
     return vggt_intrinsic
 
 
-def generate_single_pointcloud(scene_dir, idx, conf_threshold=2.0, vggt_model_resolution=518, output_dir=None, 
-                             data_subdir="out_clean", use_colmap=False, colmap_subdir="colmap_calibration/batch_000"):
+def generate_single_pointcloud(scene_dir, idx, conf_threshold=2.0, vggt_model_resolution=518, output_dir="pointclouds", 
+                             data_subdir="vggt", use_colmap=False, colmap_subdir="vggt/colmap_calibration/batch_000"):
     """
     Generate point cloud for a single depth map.
     
@@ -206,12 +206,11 @@ def generate_single_pointcloud(scene_dir, idx, conf_threshold=2.0, vggt_model_re
     images_dir = os.path.join(scene_dir, "images")
     raw_data_dir = os.path.join(scene_dir, data_subdir, "raw_data")
     individual_cameras_dir = os.path.join(scene_dir, data_subdir, "individual_cameras")
-    colmap_calibration_dir = os.path.join(scene_dir, data_subdir, colmap_subdir)
+    colmap_calibration_dir = os.path.join(scene_dir, colmap_subdir)
     
-    if output_dir is None:
-        output_dir = os.path.join(scene_dir, "pointclouds")
-    
-    os.makedirs(output_dir, exist_ok=True)
+    output_dir = os.path.join(scene_dir, output_dir)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
     
     print(f"🔍 Scene directory: {scene_dir}")
     print(f"📷 Processing image index: {idx}")
