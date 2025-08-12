@@ -26,6 +26,7 @@ from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images_square
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
+from utils.colmap_utils import save_vggt_calibration_as_colmap, save_individual_camera_parameters, load_colmap_calibration
 
 
 def parse_args():
@@ -38,6 +39,8 @@ def parse_args():
     parser.add_argument("--max_images", type=int, default=None, help="Maximum number of images to process")
     parser.add_argument("--conf_threshold", type=float, default=2.0, help="Confidence threshold to filter points (from depth head, >1).")
     parser.add_argument("--colormap", type=str, default="viridis", help="Colormap for depth visualization (e.g., viridis, jet, inferno).")
+    parser.add_argument("--save_raw_data", action="store_true", default=True, help="Save raw depth and confidence maps as numpy arrays for later use")
+    parser.add_argument("--save_cameras", action="store_true", default=True, help="Save camera parameters in COLMAP format and as individual numpy arrays")
     
     return parser.parse_args()
 
@@ -122,8 +125,17 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
     
     ply_output_dir = os.path.join(args.output_dir, "ply")
     depth_output_dir = os.path.join(args.output_dir, "depth")
+    raw_data_dir = os.path.join(args.output_dir, "raw_data")
+    cameras_dir = os.path.join(args.output_dir, "cameras")
+    colmap_dir = os.path.join(args.output_dir, "colmap_calibration")
+    
     os.makedirs(ply_output_dir, exist_ok=True)
     os.makedirs(depth_output_dir, exist_ok=True)
+    if args.save_raw_data:
+        os.makedirs(raw_data_dir, exist_ok=True)
+    if args.save_cameras:
+        os.makedirs(cameras_dir, exist_ok=True)
+        os.makedirs(colmap_dir, exist_ok=True)
     
     # Limit number of images if specified
     if args.max_images is not None:
@@ -153,6 +165,37 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         points_3d_batch, depth_conf_batch, depth_map_batch, images_for_color, extrinsic_batch, intrinsic_batch = run_VGGT_batch_pointcloud(
             model, images_for_model, dtype, vggt_model_resolution
         )
+        
+        # Save raw data and camera parameters if requested
+        if args.save_raw_data or args.save_cameras:
+            batch_image_names = [os.path.basename(p) for p in batch_paths]
+            
+            for i in range(len(batch_paths)):
+                base_name = os.path.splitext(batch_image_names[i])[0]
+                
+                # Save raw depth and confidence maps
+                if args.save_raw_data:
+                    depth_file = os.path.join(raw_data_dir, f"{base_name}_depth.npy")
+                    conf_file = os.path.join(raw_data_dir, f"{base_name}_confidence.npy")
+                    
+                    np.save(depth_file, depth_map_batch[i])
+                    np.save(conf_file, depth_conf_batch[i])
+                    print(f"  Saved raw depth map to {depth_file}")
+                    print(f"  Saved confidence map to {conf_file}")
+            
+            # Save camera parameters in both formats
+            if args.save_cameras:
+                # Save individual numpy arrays
+                save_individual_camera_parameters(
+                    extrinsic_batch, intrinsic_batch, batch_image_names, cameras_dir
+                )
+                
+                # Save COLMAP format calibration
+                colmap_batch_dir = os.path.join(colmap_dir, f"batch_{batch_idx:03d}")
+                save_vggt_calibration_as_colmap(
+                    [extrinsic_batch], [intrinsic_batch], [batch_image_names], 
+                    colmap_batch_dir, vggt_model_resolution
+                )
         
         # --- Save Combined Batch Point Cloud ---
         # Flatten all points, confidences, and colors from the batch
@@ -214,6 +257,119 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         del images, images_for_model, points_3d_batch, depth_conf_batch, depth_map_batch, images_for_color
         torch.cuda.empty_cache()
         gc.collect()
+    
+    # Save processing metadata
+    save_processing_metadata(args, image_paths, args.output_dir)
+
+
+def save_processing_metadata(args, image_paths, output_dir):
+    """Save metadata about the processing parameters and file structure."""
+    import json
+    
+    metadata = {
+        'processing_parameters': {
+            'scene_dir': args.scene_dir,
+            'output_dir': output_dir,
+            'seed': args.seed,
+            'resolution': args.resolution,
+            'batch_size': args.batch_size,
+            'max_images': args.max_images,
+            'conf_threshold': args.conf_threshold,
+            'colormap': args.colormap,
+            'save_raw_data': args.save_raw_data,
+            'save_cameras': args.save_cameras,
+            'vggt_model_resolution': 518
+        },
+        'file_structure': {
+            'ply_dir': 'ply/',
+            'depth_dir': 'depth/',
+            'raw_data_dir': 'raw_data/' if args.save_raw_data else None,
+            'cameras_dir': 'cameras/' if args.save_cameras else None,
+            'colmap_calibration_dir': 'colmap_calibration/' if args.save_cameras else None
+        },
+        'file_formats': {
+            'point_clouds': '.ply (trimesh format)',
+            'depth_maps': '.png (colorized visualization)',
+            'raw_depth': '.npy (numpy array, float32)',
+            'confidence': '.npy (numpy array, float32)',
+            'extrinsics': '.npy (numpy array, shape [3, 4])',
+            'intrinsics': '.npy (numpy array, shape [3, 3])',
+            'colmap_calibration': 'COLMAP sparse reconstruction format (cameras.txt, images.txt, points3D.txt)'
+        },
+        'data_info': {
+            'total_images_processed': len(image_paths),
+            'image_names': [os.path.basename(p) for p in image_paths]
+        }
+    }
+    
+    metadata_file = os.path.join(output_dir, 'processing_metadata.json')
+    with open(metadata_file, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    print(f"Processing metadata saved to {metadata_file}")
+
+
+def load_vggt_data(data_dir, image_name):
+    """
+    Load VGGT data for a specific image.
+    
+    Args:
+        data_dir: Directory containing the VGGT output
+        image_name: Name of the image (without extension)
+    
+    Returns:
+        dict: Dictionary containing loaded data
+    """
+    from utils.colmap_utils import load_individual_camera_parameters
+    
+    data = {}
+    
+    # Load raw depth and confidence maps
+    raw_data_dir = os.path.join(data_dir, "raw_data")
+    if os.path.exists(raw_data_dir):
+        depth_file = os.path.join(raw_data_dir, f"{image_name}_depth.npy")
+        conf_file = os.path.join(raw_data_dir, f"{image_name}_confidence.npy")
+        
+        if os.path.exists(depth_file):
+            data['depth_map'] = np.load(depth_file)
+        if os.path.exists(conf_file):
+            data['confidence_map'] = np.load(conf_file)
+    
+    # Load camera parameters (try numpy arrays first, then COLMAP format)
+    cameras_dir = os.path.join(data_dir, "cameras")
+    if os.path.exists(cameras_dir):
+        camera_data = load_individual_camera_parameters(image_name, cameras_dir)
+        if camera_data:
+            data.update(camera_data)
+    
+    # If camera data not found in numpy format, try COLMAP format
+    if 'extrinsic' not in data or 'intrinsic' not in data:
+        colmap_dir = os.path.join(data_dir, "colmap_calibration")
+        if os.path.exists(colmap_dir):
+            # Find the batch directory containing this image
+            for batch_dir in os.listdir(colmap_dir):
+                batch_path = os.path.join(colmap_dir, batch_dir)
+                if os.path.isdir(batch_path):
+                    colmap_data = load_colmap_calibration(batch_path)
+                    if colmap_data and image_name in colmap_data['images']:
+                        image_data = colmap_data['images'][image_name]
+                        data['extrinsic'] = image_data['extrinsic']
+                        data['intrinsic'] = image_data['intrinsic']
+                        break
+    
+    # Load point cloud
+    ply_dir = os.path.join(data_dir, "ply")
+    ply_file = os.path.join(ply_dir, f"{image_name}.ply")
+    if os.path.exists(ply_file):
+        data['point_cloud'] = trimesh.load(ply_file)
+    
+    # Load colorized depth map
+    depth_dir = os.path.join(data_dir, "depth")
+    depth_file = os.path.join(depth_dir, f"{image_name}_depth.png")
+    if os.path.exists(depth_file):
+        data['colorized_depth'] = np.array(Image.open(depth_file))
+    
+    return data
 
 
 def main():
