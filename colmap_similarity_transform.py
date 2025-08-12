@@ -21,6 +21,10 @@ import os
 import json
 import argparse
 import pycolmap
+import trimesh
+from PIL import Image
+import torch
+import torch.nn.functional as F
 from scipy.spatial.transform import Rotation as R
 
 # Import functions from utils/similarity_transform.py
@@ -30,6 +34,10 @@ from utils.similarity_transform import (
     extract_camera_poses,
     apply_similarity_transform
 )
+
+# Import VGGT utilities for point cloud generation
+from vggt.utils.geometry import unproject_depth_map_to_point_map
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 
 def parse_arguments():
@@ -45,6 +53,12 @@ Examples:
   # Use robust transform to handle outliers
   python colmap_similarity_transform.py --source src --target dst --output out --robust
 
+  # Transform existing point cloud
+  python colmap_similarity_transform.py --source vggt/colmap --target reference/colmap --output aligned --pointcloud input.ply
+
+  # Generate point cloud from depth maps with colors
+  python colmap_similarity_transform.py --source vggt/colmap --target reference/colmap --output aligned --depth-maps depth/ --confidence-maps conf/ --images images/
+
   # Generate test data with known transform
   python colmap_similarity_transform.py --source colmap/sparse/0 --test-mode --output test_transformed
         """
@@ -56,6 +70,16 @@ Examples:
                        help="Path to target COLMAP sparse reconstruction directory")
     parser.add_argument("--output", type=str, required=True,
                        help="Path to output directory for transformed calibration")
+    parser.add_argument("--pointcloud", type=str, required=False,
+                       help="Path to point cloud file (.ply) to transform and save as aligned.ply")
+    parser.add_argument("--depth-maps", type=str, required=False,
+                       help="Directory containing raw depth maps (.npy files)")
+    parser.add_argument("--confidence-maps", type=str, required=False,
+                       help="Directory containing confidence maps (.npy files)")
+    parser.add_argument("--images", type=str, required=False,
+                       help="Directory containing original images for color sampling")
+    parser.add_argument("--conf-threshold", type=float, default=2.0,
+                       help="Confidence threshold for filtering points (default: 2.0)")
     
     # Transform options
     parser.add_argument("--robust", action="store_true", default=False,
@@ -168,6 +192,247 @@ def save_reconstruction(reconstruction, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     reconstruction.write_text(output_dir)
     print(f"Saved reconstruction to {output_dir}")
+
+
+def transform_and_save_pointcloud(pointcloud_path, transform_params, output_dir):
+    """
+    Transform a point cloud using the similarity transform and save it.
+    
+    Args:
+        pointcloud_path: Path to the input point cloud file (.ply)
+        transform_params: Dict with 'scale', 'rotation', 'translation' keys
+        output_dir: Directory to save the transformed point cloud
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        # Load the point cloud
+        mesh = trimesh.load(pointcloud_path)
+        if not hasattr(mesh, 'vertices'):
+            print(f"Error: {pointcloud_path} does not contain vertices")
+            return False
+        
+        points = mesh.vertices
+        colors = mesh.colors if hasattr(mesh, 'colors') else None
+        
+        print(f"Loaded point cloud with {len(points)} points from {pointcloud_path}")
+        
+        # Apply the similarity transform
+        transformed_points = apply_similarity_transform(points, transform_params)
+        
+        # Create new point cloud with transformed points
+        if colors is not None:
+            transformed_mesh = trimesh.PointCloud(vertices=transformed_points, colors=colors)
+        else:
+            transformed_mesh = trimesh.PointCloud(vertices=transformed_points)
+        
+        # Save the transformed point cloud
+        output_path = os.path.join(output_dir, "aligned.ply")
+        transformed_mesh.export(output_path)
+        
+        print(f"Transformed point cloud saved to {output_path}")
+        print(f"  Original point range: X[{points[:,0].min():.3f}, {points[:,0].max():.3f}], "
+              f"Y[{points[:,1].min():.3f}, {points[:,1].max():.3f}], "
+              f"Z[{points[:,2].min():.3f}, {points[:,2].max():.3f}]")
+        print(f"  Transformed point range: X[{transformed_points[:,0].min():.3f}, {transformed_points[:,0].max():.3f}], "
+              f"Y[{transformed_points[:,1].min():.3f}, {transformed_points[:,1].max():.3f}], "
+              f"Z[{transformed_points[:,2].min():.3f}, {transformed_points[:,2].max():.3f}]")
+        
+        return True
+        
+    except Exception as e:
+        print(f"Error transforming point cloud: {e}")
+        return False
+
+
+def generate_pointcloud_from_depth_maps(depth_maps_dir, confidence_maps_dir, original_calibration_dir, 
+                                       output_dir, conf_threshold=2.0, vggt_model_resolution=518, images_dir=None, 
+                                       similarity_transform=None):
+    """
+    Generate point cloud from depth maps using transformed calibration data.
+    
+    Args:
+        depth_maps_dir: Directory containing depth maps (.npy files)
+        confidence_maps_dir: Directory containing confidence maps (.npy files)
+        transformed_calibration_dir: Directory containing transformed COLMAP calibration
+        output_dir: Directory to save the generated point cloud
+        conf_threshold: Confidence threshold for filtering points
+        vggt_model_resolution: Resolution used by VGGT model (default: 518)
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        from utils.colmap_utils import load_colmap_calibration
+        
+        # Load original calibration (before transformation)
+        calibration_data = load_colmap_calibration(original_calibration_dir)
+        if not calibration_data or 'images' not in calibration_data:
+            print(f"Error: Could not load calibration from {original_calibration_dir}")
+            return False
+        
+        # Get list of depth and confidence map files
+        depth_files = []
+        conf_files = []
+        
+        if os.path.exists(depth_maps_dir):
+            depth_files = sorted([f for f in os.listdir(depth_maps_dir) if f.endswith('_depth.npy')])
+        
+        if os.path.exists(confidence_maps_dir):
+            conf_files = sorted([f for f in os.listdir(confidence_maps_dir) if f.endswith('_confidence.npy')])
+        
+        if not depth_files or not conf_files:
+            print(f"Error: No depth or confidence map files found")
+            print(f"  Depth maps dir: {depth_maps_dir}")
+            print(f"  Confidence maps dir: {confidence_maps_dir}")
+            return False
+        
+        print(f"Found {len(depth_files)} depth maps and {len(conf_files)} confidence maps")
+        
+        # Collect all points and colors
+        all_points = []
+        all_colors = []
+        
+        for depth_file in depth_files:
+            # Extract image name from depth file (e.g., "00000_depth.npy" -> "00000.jpg")
+            base_name = depth_file.replace('_depth.npy', '')
+            image_name = f"{base_name}.jpg"
+            
+            # Find corresponding confidence file
+            conf_file = f"{base_name}_confidence.npy"
+            
+            if image_name not in calibration_data['images']:
+                print(f"Warning: No calibration data for {image_name}, skipping")
+                continue
+            
+            if conf_file not in conf_files:
+                print(f"Warning: No confidence map for {image_name}, skipping")
+                continue
+            
+            # Load depth and confidence maps
+            depth_path = os.path.join(depth_maps_dir, depth_file)
+            conf_path = os.path.join(confidence_maps_dir, conf_file)
+            
+            depth_map = np.load(depth_path)
+            confidence_map = np.load(conf_path)
+            
+            # Get camera parameters
+            image_data = calibration_data['images'][image_name]
+            extrinsic = image_data['extrinsic']
+            intrinsic = image_data['intrinsic']
+            
+            # Filter by confidence
+            conf_mask = confidence_map > conf_threshold
+            
+            if not conf_mask.any():
+                print(f"Warning: No points above confidence threshold for {image_name}")
+                continue
+            
+            # Unproject depth map to 3D points
+            # Add batch dimension and ensure correct shape (H, W, 1)
+            depth_map_batch = depth_map[np.newaxis, ..., np.newaxis]  # Add batch and channel dimensions
+            extrinsic_batch = extrinsic[np.newaxis, ...]  # Add batch dimension
+            intrinsic_batch = intrinsic[np.newaxis, ...]  # Add batch dimension
+            
+            points_3d_batch = unproject_depth_map_to_point_map(
+                depth_map_batch, extrinsic_batch, intrinsic_batch
+            )
+            points_3d = points_3d_batch[0]  # Remove batch dimension
+            
+            # Apply confidence filter
+            filtered_points = points_3d[conf_mask]
+            
+            # Load and sample colors from original image
+            if images_dir and os.path.exists(images_dir):
+                # Try to find the original image
+                image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
+                original_image_path = None
+                
+                for ext in image_extensions:
+                    potential_path = os.path.join(images_dir, f"{base_name}{ext}")
+                    if os.path.exists(potential_path):
+                        original_image_path = potential_path
+                        break
+                
+                if original_image_path:
+                    try:
+                        # Load and preprocess image for color sampling
+                        image = Image.open(original_image_path).convert('RGB')
+                        
+                        # Resize image to match depth map resolution
+                        depth_h, depth_w = depth_map.shape
+                        image_resized = image.resize((depth_w, depth_h), Image.Resampling.LANCZOS)
+                        image_array = np.array(image_resized)  # HxWx3, uint8
+                        
+                        # Sample colors using the same confidence mask
+                        filtered_colors = image_array[conf_mask]
+                        
+                        print(f"  {image_name}: {len(filtered_points)} points (with colors from image)")
+                    except Exception as e:
+                        print(f"Warning: Could not load colors from {original_image_path}: {e}")
+                        # Fallback to gray colors
+                        filtered_colors = np.zeros((len(filtered_points), 3), dtype=np.uint8)
+                        filtered_colors[:, :] = 128
+                else:
+                    print(f"Warning: No original image found for {base_name}, using gray colors")
+                    filtered_colors = np.zeros((len(filtered_points), 3), dtype=np.uint8)
+                    filtered_colors[:, :] = 128
+            else:
+                # No images directory provided, use gray colors
+                filtered_colors = np.zeros((len(filtered_points), 3), dtype=np.uint8)
+                filtered_colors[:, :] = 128
+            
+            all_points.append(filtered_points)
+            all_colors.append(filtered_colors)
+            
+            print(f"  {image_name}: {len(filtered_points)} points")
+        
+        if not all_points:
+            print("Error: No valid points generated from any depth map")
+            return False
+        
+        # Combine all points
+        combined_points = np.vstack(all_points)
+        combined_colors = np.vstack(all_colors)
+        
+        print(f"Generated {len(combined_points)} total points from depth maps")
+        
+        # Apply similarity transform if provided
+        if similarity_transform is not None:
+            print(f"Applying similarity transform to generated point cloud...")
+            transformed_points = apply_similarity_transform(combined_points, similarity_transform)
+            
+            # Create transformed point cloud
+            transformed_point_cloud = trimesh.PointCloud(vertices=transformed_points, colors=combined_colors)
+            output_path = os.path.join(output_dir, "generated_from_depth.ply")
+            transformed_point_cloud.export(output_path)
+            
+            print(f"Transformed point cloud generated from depth maps saved to {output_path}")
+            print(f"  Original point range: X[{combined_points[:,0].min():.3f}, {combined_points[:,0].max():.3f}], "
+                  f"Y[{combined_points[:,1].min():.3f}, {combined_points[:,1].max():.3f}], "
+                  f"Z[{combined_points[:,2].min():.3f}, {combined_points[:,2].max():.3f}]")
+            print(f"  Transformed point range: X[{transformed_points[:,0].min():.3f}, {transformed_points[:,0].max():.3f}], "
+                  f"Y[{transformed_points[:,1].min():.3f}, {transformed_points[:,1].max():.3f}], "
+                  f"Z[{transformed_points[:,2].min():.3f}, {transformed_points[:,2].max():.3f}]")
+        else:
+            # Create and save point cloud without transformation
+            point_cloud = trimesh.PointCloud(vertices=combined_points, colors=combined_colors)
+            output_path = os.path.join(output_dir, "generated_from_depth.ply")
+            point_cloud.export(output_path)
+            
+            print(f"Point cloud generated from depth maps saved to {output_path}")
+            print(f"  Point range: X[{combined_points[:,0].min():.3f}, {combined_points[:,0].max():.3f}], "
+                  f"Y[{combined_points[:,1].min():.3f}, {combined_points[:,1].max():.3f}], "
+                  f"Z[{combined_points[:,2].min():.3f}, {combined_points[:,2].max():.3f}]")
+        
+        return True
+        
+    except Exception as e:
+        print(f"Error generating point cloud from depth maps: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 def create_test_data(source_dir, output_dir, scale, rotation_axis_angle, translation, num_cameras):
@@ -416,6 +681,58 @@ def main():
                     print("✅ Perfect recovery - implementation validated!")
                 else:
                     print("⚠️  Some numerical errors detected")
+            
+            # Transform point cloud if provided (in test mode)
+            if args.pointcloud:
+                if not args.quiet:
+                    print(f"\n=== Point Cloud Transformation (Test Mode) ===")
+                    print(f"Input point cloud: {args.pointcloud}")
+                
+                # Use the recovered transform parameters
+                transform_params = {
+                    'scale': stats['transform_parameters']['scale'],
+                    'rotation': np.array(stats['transform_parameters']['rotation_matrix']),
+                    'translation': np.array(stats['transform_parameters']['translation'])
+                }
+                
+                # Transform and save point cloud
+                success = transform_and_save_pointcloud(
+                    args.pointcloud, transform_params, args.output
+                )
+                
+                if success:
+                    if not args.quiet:
+                        print(f"✅ Point cloud transformation completed successfully!")
+                else:
+                    if not args.quiet:
+                        print(f"❌ Point cloud transformation failed!")
+            
+            # Generate point cloud from depth maps if provided (in test mode)
+            if args.depth_maps and args.confidence_maps:
+                if not args.quiet:
+                    print(f"\n=== Point Cloud Generation from Depth Maps (Test Mode) ===")
+                    print(f"Depth maps directory: {args.depth_maps}")
+                    print(f"Confidence maps directory: {args.confidence_maps}")
+                
+                # Use the recovered transform parameters
+                transform_params = {
+                    'scale': stats['transform_parameters']['scale'],
+                    'rotation': np.array(stats['transform_parameters']['rotation_matrix']),
+                    'translation': np.array(stats['transform_parameters']['translation'])
+                }
+                
+                success = generate_pointcloud_from_depth_maps(
+                    args.depth_maps, args.confidence_maps, args.source, args.output,
+                    conf_threshold=args.conf_threshold, images_dir=args.images,
+                    similarity_transform=transform_params
+                )
+                
+                if success:
+                    if not args.quiet:
+                        print(f"✅ Point cloud generation from depth maps completed successfully!")
+                else:
+                    if not args.quiet:
+                        print(f"❌ Point cloud generation from depth maps failed!")
         
         else:
             # Normal mode: transform between two existing reconstructions
@@ -426,10 +743,66 @@ def main():
                 args.source, args.target, args.output,
                 use_robust=args.robust, save_stats=args.save_stats, quiet=args.quiet
             )
+            
+            # Transform point cloud if provided
+            if args.pointcloud:
+                if not args.quiet:
+                    print(f"\n=== Point Cloud Transformation ===")
+                    print(f"Input point cloud: {args.pointcloud}")
+                
+                # Extract transform parameters from stats
+                transform_params = {
+                    'scale': stats['transform_parameters']['scale'],
+                    'rotation': np.array(stats['transform_parameters']['rotation_matrix']),
+                    'translation': np.array(stats['transform_parameters']['translation'])
+                }
+                
+                # Transform and save point cloud
+                success = transform_and_save_pointcloud(
+                    args.pointcloud, transform_params, args.output
+                )
+                
+                if success:
+                    if not args.quiet:
+                        print(f"✅ Point cloud transformation completed successfully!")
+                else:
+                    if not args.quiet:
+                        print(f"❌ Point cloud transformation failed!")
+            
+            # Generate point cloud from depth maps if provided
+            if args.depth_maps and args.confidence_maps:
+                if not args.quiet:
+                    print(f"\n=== Point Cloud Generation from Depth Maps ===")
+                    print(f"Depth maps directory: {args.depth_maps}")
+                    print(f"Confidence maps directory: {args.confidence_maps}")
+                
+                # Extract transform parameters from stats
+                transform_params = {
+                    'scale': stats['transform_parameters']['scale'],
+                    'rotation': np.array(stats['transform_parameters']['rotation_matrix']),
+                    'translation': np.array(stats['transform_parameters']['translation'])
+                }
+                
+                success = generate_pointcloud_from_depth_maps(
+                    args.depth_maps, args.confidence_maps, args.source, args.output,
+                    conf_threshold=args.conf_threshold, images_dir=args.images, 
+                    similarity_transform=transform_params
+                )
+                
+                if success:
+                    if not args.quiet:
+                        print(f"✅ Point cloud generation from depth maps completed successfully!")
+                else:
+                    if not args.quiet:
+                        print(f"❌ Point cloud generation from depth maps failed!")
         
         if not args.quiet:
             print(f"\n✅ Similarity transform completed successfully!")
             print(f"Transformed reconstruction saved to: {args.output}")
+            if args.pointcloud:
+                print(f"Transformed point cloud saved to: {os.path.join(args.output, 'aligned.ply')}")
+            if args.depth_maps and args.confidence_maps:
+                print(f"Generated point cloud saved to: {os.path.join(args.output, 'generated_from_depth.ply')}")
         
         return 0
         

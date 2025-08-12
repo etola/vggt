@@ -30,19 +30,20 @@ def save_vggt_calibration_as_colmap(extrinsics_list: List[np.ndarray],
     """
     reconstruction = pycolmap.Reconstruction()
     
-    # Create cameras (assuming SIMPLE_PINHOLE for simplicity)
+    # Create cameras (using PINHOLE to preserve both fx and fy)
     camera_id = 1
     for batch_idx, intrinsics_batch in enumerate(intrinsics_list):
         for i, intrinsic in enumerate(intrinsics_batch):
             camera = pycolmap.Camera()
             camera.camera_id = camera_id
-            camera.model = "SIMPLE_PINHOLE"
+            camera.model = "PINHOLE"
             
             # Extract individual float values from the intrinsic matrix
-            f = float(intrinsic[0, 0])    # focal length
+            fx = float(intrinsic[0, 0])   # focal length x
+            fy = float(intrinsic[1, 1])   # focal length y
             cx = float(intrinsic[0, 2])   # principal point x
             cy = float(intrinsic[1, 2])   # principal point y
-            camera.params = [f, cx, cy]
+            camera.params = [fx, fy, cx, cy]
             camera.width = vggt_model_resolution
             camera.height = vggt_model_resolution
             reconstruction.add_camera(camera)
@@ -121,11 +122,18 @@ def load_colmap_calibration(colmap_dir: str) -> Dict:
                 
                 # Create intrinsic matrix from camera parameters
                 camera = reconstruction.cameras[image.camera_id]
-                if camera.model == "SIMPLE_PINHOLE":
+                if camera.model.name == "SIMPLE_PINHOLE":
                     f, cx, cy = camera.params
                     intrinsic = np.array([
                         [f, 0, cx],
                         [0, f, cy],
+                        [0, 0, 1]
+                    ])
+                elif camera.model.name == "PINHOLE":
+                    fx, fy, cx, cy = camera.params
+                    intrinsic = np.array([
+                        [fx, 0, cx],
+                        [0, fy, cy],
                         [0, 0, 1]
                     ])
                 else:
