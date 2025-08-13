@@ -4,6 +4,25 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+VGGT Batch Point Cloud Generation
+
+Generate point clouds from image sequences using VGGT model with batched processing.
+
+Examples:
+    # Basic usage with short flags
+    python3 generate_batched_pointcloud.py -s images/ -o output/
+
+    # Specify batch size and resolution
+    python3 generate_batched_pointcloud.py -s images/ -o output/ -b 16 -r 512
+
+    # Limit number of images and set confidence threshold
+    python3 generate_batched_pointcloud.py -s images/ -o output/ -m 50 -c 1.5
+
+    # Process with custom settings
+    python3 generate_batched_pointcloud.py -s images/ -o output/ -b 4 -c 2.5 --colormap jet
+"""
+
 import random
 import numpy as np
 import glob
@@ -31,13 +50,13 @@ from utils.colmap_utils import save_vggt_calibration_as_colmap, save_individual_
 
 def parse_args():
     parser = argparse.ArgumentParser(description="VGGT Batch Point Cloud Estimation")
-    parser.add_argument("--scene_dir", type=str, required=True, help="Directory containing the scene images")
-    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the output point clouds and depth maps")
+    parser.add_argument("-s", "--scene_dir", type=str, required=True, help="Directory containing the scene images")
+    parser.add_argument("-o", "--output_dir", type=str, required=True, help="Directory to save the output point clouds and depth maps")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--resolution", type=int, default=518, help="Preprocessing resolution. Model always runs at 518.")
-    parser.add_argument("--batch_size", type=int, default=8, help="Number of images to process together.")
-    parser.add_argument("--max_images", type=int, default=None, help="Maximum number of images to process")
-    parser.add_argument("--conf_threshold", type=float, default=2.0, help="Confidence threshold to filter points (from depth head, >1).")
+    parser.add_argument("-r", "--resolution", type=int, default=518, help="Preprocessing resolution. Model always runs at 518.")
+    parser.add_argument("-b", "--batch_size", type=int, default=8, help="Number of images to process together.")
+    parser.add_argument("-m", "--max_images", type=int, default=None, help="Maximum number of images to process")
+    parser.add_argument("-c", "--conf_threshold", type=float, default=2.0, help="Confidence threshold to filter points (from depth head, >1).")
     parser.add_argument("--colormap", type=str, default="viridis", help="Colormap for depth visualization (e.g., viridis, jet, inferno).")
     parser.add_argument("--save_raw_data", action="store_true", default=True, help="Save raw depth and confidence maps as numpy arrays for later use")
     

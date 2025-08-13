@@ -14,15 +14,15 @@ from utils.colmap_utils import load_colmap_calibration
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Generate point cloud from single depth map")
-    parser.add_argument("--scene_dir", type=str, required=True,
+    parser.add_argument("-s", "--scene_dir", type=str, required=True,
                        help="Path to scene directory containing images/ and data_subdir/ with VGGT outputs")
-    parser.add_argument("--idx", type=int, required=True,
+    parser.add_argument("-i", "--idx", type=int, required=True,
                        help="Index of the image to generate point cloud for (0-based)")
-    parser.add_argument("--conf_threshold", type=float, default=2.0,
+    parser.add_argument("-c", "--conf_threshold", type=float, default=2.0,
                        help="Confidence threshold for filtering points (default: 2.0)")
-    parser.add_argument("--output_dir", type=str, default="pointclouds",
+    parser.add_argument("-o", "--output_dir", type=str, default="pointclouds",
                        help="Output directory for point cloud (default: scene_dir/pointclouds)")
-    parser.add_argument("--vggt_model_resolution", type=int, default=518,
+    parser.add_argument("-r", "--vggt_model_resolution", type=int, default=518,
                        help="VGGT model resolution (default: 518)")
     parser.add_argument("--data_subdir", type=str, default="vggt",
                        help="Subdirectory containing vggt data (default: vggt)")
