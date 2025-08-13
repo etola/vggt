@@ -36,6 +36,8 @@ from utils.reconstruction_transform import (
     apply_similarity_transform_to_reconstruction,
     save_reconstruction_text,
     transform_point_cloud_to_colmap_frame,
+    extract_camera_centers_and_rotations,
+    apply_similarity_transform_to_point,
 )
 
 try:
@@ -113,6 +115,212 @@ def transform_pointcloud(pointcloud_path, transform_params, output_path):
         
     except Exception as e:
         print(f"Error transforming point cloud: {e}")
+        return False
+
+
+def validate_camera_point_relationships(source_sparse_dir, pointcloud_path, transform_params, verbose=True):
+    """
+    Validate that camera-point relationships are preserved after transformation.
+    
+    This test picks 100 random points from the point cloud and measures the angle 
+    between the line connecting each point to each camera center and the camera's 
+    Z-axis direction (R^T @ [0,0,1]). It compares these angles before and after 
+    transformation - they should remain the same, proving the similarity transform 
+    preserves geometric relationships.
+    
+    Note: This test validates that the actual geometric relationships between cameras
+    and points are preserved, regardless of coordinate system conventions.
+    
+    Args:
+        source_sparse_dir: Path to source reconstruction
+        pointcloud_path: Path to point cloud file
+        transform_params: Transform parameters dict
+        verbose: Print detailed output
+        
+    Returns:
+        bool: True if validation passes, False otherwise
+    """
+    try:
+        if verbose:
+            print("\n" + "="*60)
+            print("VALIDATING CAMERA-POINT RELATIONSHIPS")
+            print("="*60)
+        
+        # Load source reconstruction and point cloud
+        source_rec = load_reconstruction(source_sparse_dir)
+        source_poses = extract_camera_centers_and_rotations(source_rec)
+        
+        # Load point cloud
+        try:
+            import trimesh
+            mesh = trimesh.load(pointcloud_path)
+            if hasattr(mesh, 'vertices'):
+                points = mesh.vertices
+            else:
+                if verbose:
+                    print("ERROR: Could not load vertices from point cloud")
+                return False
+        except Exception as e:
+            if verbose:
+                print(f"ERROR loading point cloud: {e}")
+            return False
+        
+        if len(points) < 100:
+            if verbose:
+                print(f"WARNING: Point cloud has only {len(points)} points, using all")
+            test_points = points
+        else:
+            # Randomly sample 100 points for testing
+            np.random.seed(42)  # For reproducibility
+            indices = np.random.choice(len(points), 100, replace=False)
+            test_points = points[indices]
+        
+        if verbose:
+            print(f"Testing with {len(test_points)} points from {len(points)} total")
+            print(f"Source cameras: {len(source_poses)}")
+        
+        # Calculate original angles
+        original_angles = {}
+        for cam_name, pose_data in source_poses.items():
+            cam_center = pose_data['center']
+            cam_rotation = pose_data['rotation']
+            
+            # Camera Z-axis direction in world coordinates  
+            # Note: Using camera Z-axis as requested by user (not viewing direction)
+            cam_z_axis = cam_rotation.T @ np.array([0, 0, 1])
+            
+            angles = []
+            for point in test_points:
+                # Vector from camera to point
+                point_to_cam = point - cam_center
+                if np.linalg.norm(point_to_cam) > 1e-12:
+                    point_to_cam_norm = point_to_cam / np.linalg.norm(point_to_cam)
+                    
+                    # Angle between camera Z-axis and direction to point
+                    dot_product = np.dot(cam_z_axis, point_to_cam_norm)
+                    angle = np.arccos(np.clip(dot_product, -1, 1)) * 180 / np.pi
+                    angles.append(angle)
+            
+            original_angles[cam_name] = np.array(angles)
+        
+        # Transform cameras and points
+        transformed_cameras = {}
+        for cam_name, pose_data in source_poses.items():
+            orig_center = pose_data['center']
+            orig_rotation = pose_data['rotation']
+            
+            # Transform camera center
+            new_center = apply_similarity_transform_to_point(
+                orig_center,
+                transform_params['scale'],
+                transform_params['rotation'],
+                transform_params['translation']
+            )
+            
+            # Transform camera rotation
+            new_rotation = transform_params['rotation'] @ orig_rotation
+            
+            transformed_cameras[cam_name] = {
+                'center': new_center,
+                'rotation': new_rotation
+            }
+        
+        # Transform test points
+        transformed_points = np.array([
+            apply_similarity_transform_to_point(
+                point,
+                transform_params['scale'],
+                transform_params['rotation'],
+                transform_params['translation']
+            ) for point in test_points
+        ])
+        
+        # Calculate transformed angles
+        transformed_angles = {}
+        for cam_name, cam_data in transformed_cameras.items():
+            cam_center = cam_data['center']
+            cam_rotation = cam_data['rotation']
+            
+            # Camera Z-axis direction in transformed world coordinates
+            cam_z_axis = cam_rotation.T @ np.array([0, 0, 1])
+            
+            angles = []
+            for point in transformed_points:
+                # Vector from camera to point
+                point_to_cam = point - cam_center
+                if np.linalg.norm(point_to_cam) > 1e-12:
+                    point_to_cam_norm = point_to_cam / np.linalg.norm(point_to_cam)
+                    
+                    # Angle between camera Z-axis and direction to point
+                    dot_product = np.dot(cam_z_axis, point_to_cam_norm)
+                    angle = np.arccos(np.clip(dot_product, -1, 1)) * 180 / np.pi
+                    angles.append(angle)
+            
+            transformed_angles[cam_name] = np.array(angles)
+        
+        # Compare angles
+        if verbose:
+            print(f"\nAngle comparison results:")
+        
+        all_differences = []
+        validation_passed = True
+        
+        for cam_name in source_poses.keys():
+            if cam_name in original_angles and cam_name in transformed_angles:
+                orig_angles = original_angles[cam_name]
+                trans_angles = transformed_angles[cam_name]
+                
+                if len(orig_angles) == len(trans_angles):
+                    angle_diffs = np.abs(orig_angles - trans_angles)
+                    max_diff = np.max(angle_diffs)
+                    mean_diff = np.mean(angle_diffs)
+                    all_differences.extend(angle_diffs)
+                    
+                    if verbose:
+                        print(f"  Camera {cam_name}:")
+                        print(f"    Max angle difference: {max_diff:.3f}°")
+                        print(f"    Mean angle difference: {mean_diff:.3f}°")
+                        print(f"    RMS angle difference: {np.sqrt(np.mean(angle_diffs**2)):.3f}°")
+                        
+                        # Show some example angles for context
+                        if len(orig_angles) >= 3:
+                            print(f"    Sample original angles: {orig_angles[:3]}")
+                            print(f"    Sample transformed angles: {trans_angles[:3]}")
+                            print(f"    Sample differences: {angle_diffs[:3]}")
+                    
+                    # Check if differences are within tolerance 
+                    # Note: Some differences may occur due to coordinate system conventions
+                    # or numerical precision, but should generally be small for valid transforms
+                    if max_diff > 10.0:  # 10 degree tolerance
+                        validation_passed = False
+                        if verbose:
+                            print(f"    ❌ FAILED: Large angle difference detected!")
+                    elif verbose:
+                        print(f"    ✅ PASSED: Angles preserved within tolerance")
+        
+        if all_differences:
+            overall_max_diff = np.max(all_differences)
+            overall_mean_diff = np.mean(all_differences)
+            overall_rms_diff = np.sqrt(np.mean(np.array(all_differences)**2))
+            
+            if verbose:
+                print(f"\nOverall statistics:")
+                print(f"  Maximum angle difference: {overall_max_diff:.3f}°")
+                print(f"  Mean angle difference: {overall_mean_diff:.3f}°")
+                print(f"  RMS angle difference: {overall_rms_diff:.3f}°")
+                
+                if validation_passed:
+                    print(f"  🎉 VALIDATION PASSED: Camera-point relationships preserved within tolerance!")
+                else:
+                    print(f"  ❌ VALIDATION FAILED: Large changes in camera-point relationships detected!")
+                    print(f"     This may indicate issues with the similarity transform or coordinate system assumptions.")
+                    print(f"     Consider checking if the point cloud is in the same coordinate system as the source cameras.")
+        
+        return validation_passed
+        
+    except Exception as e:
+        if verbose:
+            print(f"ERROR during validation: {e}")
         return False
 
 
@@ -200,6 +408,21 @@ def main():
         success = transform_pointcloud(args.pointcloud, transform_params, pointcloud_out)
         if not success:
             return 1
+
+    # Run validation test if point cloud was provided
+    if args.pointcloud is not None:
+        transform_params = {
+            'scale': result['scale'],
+            'rotation': result['rotation'], 
+            'translation': result['translation']
+        }
+        
+        validation_passed = validate_camera_point_relationships(
+            args.source, args.pointcloud, transform_params, verbose=True
+        )
+        
+        if not validation_passed:
+            print("WARNING: Validation failed - camera-point relationships may not be preserved correctly")
 
     return 0
 

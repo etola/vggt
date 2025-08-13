@@ -141,7 +141,34 @@ def estimate_similarity_transform_from_recons(
     scale = estimate_scale_from_centers(src_centers, dst_centers, robust=robust_scale)
 
     scaled_src = scale * src_centers
-    R_est, t_est = estimate_rigid_transform(scaled_src, dst_centers)
+
+    # Align the source's first camera to the destination's first camera using their centers and rotation matrices
+    # Use the scaled source center and its rotation, and the destination center and rotation
+    if len(common) == 0:
+        raise ValueError("No common images found between source and target reconstructions.")
+
+    # Use the first common image
+    first_img = common[0]
+    src_pose = src_poses[first_img]
+    dst_pose = dst_poses[first_img]
+
+    # Scaled source center
+    src_center_scaled = scale * np.asarray(src_pose["center"], dtype=float)
+    dst_center = np.asarray(dst_pose["center"], dtype=float)
+
+    # Rotation matrices
+    src_rot = np.asarray(src_pose["rotation"], dtype=float)
+    dst_rot = np.asarray(dst_pose["rotation"], dtype=float)
+
+    # The rotation that aligns the source camera to the destination camera
+    # R_est * src_rot = dst_rot  =>  R_est = dst_rot @ src_rot.T
+    R_est = dst_rot @ src_rot.T
+
+    # The translation that aligns the (rotated) scaled source center to the destination center
+    t_est = dst_center - R_est @ src_center_scaled
+
+
+    # R_est, t_est = estimate_rigid_transform(scaled_src, dst_centers)
 
     transformed = (R_est @ scaled_src.T).T + t_est
     rmse = float(np.sqrt(np.mean(np.sum((transformed - dst_centers) ** 2, axis=1))))
@@ -152,6 +179,46 @@ def estimate_similarity_transform_from_recons(
         for center in src_centers
     ])
     
+    # For validation: apply the estimated transform to the camera R, t and measure the error
+    # between the transformed camera's z axis and the target camera's z axis
+
+    # We'll compute the angle (in degrees) between the transformed source camera z-axis and the target camera z-axis
+    z_axis_errors = []
+    for name in common:
+        src_pose = src_poses[name]
+        dst_pose = dst_poses[name]
+
+        # Source camera center and rotation
+        src_center = np.asarray(src_pose["center"], dtype=float)
+        src_rot = np.asarray(src_pose["rotation"], dtype=float)
+
+        # Target camera rotation
+        dst_rot = np.asarray(dst_pose["rotation"], dtype=float)
+
+        # Transform the source camera center and rotation
+        src_center_trans = apply_similarity_transform_to_point(src_center, scale, R_est, t_est)
+        src_rot_trans = R_est @ src_rot
+
+        # Camera z-axis in world coordinates is R^T @ [0, 0, 1]
+        src_z_axis = src_rot_trans.T @ np.array([0, 0, 1])
+        dst_z_axis = dst_rot.T @ np.array([0, 0, 1])
+
+        # Normalize
+        src_z_axis /= np.linalg.norm(src_z_axis)
+        dst_z_axis /= np.linalg.norm(dst_z_axis)
+
+        # Compute angle between z-axes
+        dot = np.clip(np.dot(src_z_axis, dst_z_axis), -1.0, 1.0)
+        angle_deg = np.arccos(dot) * 180.0 / np.pi
+        z_axis_errors.append(angle_deg)
+
+    z_axis_errors = np.array(z_axis_errors)
+    max_z_axis_error = float(np.max(z_axis_errors))
+    mean_z_axis_error = float(np.mean(z_axis_errors))
+    rms_z_axis_error = float(np.sqrt(np.mean(z_axis_errors ** 2)))
+
+
+
     # Check consistency between batch and individual transforms
     validation_rmse = float(np.sqrt(np.mean(np.sum((validated_centers - dst_centers) ** 2, axis=1))))
     transform_consistency_error = float(np.sqrt(np.mean(np.sum((validated_centers - transformed) ** 2, axis=1))))
