@@ -38,6 +38,12 @@ This directory contains unit tests for the reconstruction transform functionalit
 - Verifies batch point transformation, point cloud transformation
 - Tests wrapper functions that maintain old API signatures
 
+### `test_pointcloud_alignment.py`
+- **Tests for point cloud alignment feature in align_reconstructions.py**
+- Tests end-to-end point cloud transformation with synthetic data
+- Verifies point cloud transformation accuracy and output handling
+- Tests default output path generation
+
 ## Running Tests
 
 ### Quick Tests (No dependencies needed)
@@ -52,6 +58,9 @@ python3 tests/test_estimation_simple.py
 
 # Test compatibility wrapper functions
 python3 tests/test_compatibility_functions.py
+
+# Test point cloud alignment feature
+python3 tests/test_pointcloud_alignment.py
 ```
 
 ### Full Test Suite (Requires scipy, pycolmap)
@@ -96,5 +105,12 @@ The tests verify:
 - Wrapper functions maintaining legacy API compatibility
 - Empty array handling and edge cases
 - Function signature verification
+
+**Point Cloud Alignment:**
+- End-to-end CLI testing with synthetic COLMAP reconstructions
+- Point cloud transformation accuracy verification
+- Color preservation during transformation
+- Default output path generation and handling
+- Integration testing with trimesh library
 
 All tests use high precision (1e-10 tolerance) to ensure numerical accuracy. 
