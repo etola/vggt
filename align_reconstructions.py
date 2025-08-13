@@ -14,9 +14,13 @@ Examples:
     python3 align_reconstructions.py -s source/sparse -t target/sparse \\
         -o aligned/ -p source_cloud.ply
 
-    # Specify custom point cloud output path
+    # Specify custom point cloud output path (relative to output dir)
     python3 align_reconstructions.py -s source/sparse -t target/sparse \\
-        -p source_cloud.ply -po aligned_cloud.ply
+        -o aligned/ -p source_cloud.ply -po my_cloud.ply
+
+    # Specify absolute point cloud output path
+    python3 align_reconstructions.py -s source/sparse -t target/sparse \\
+        -p source_cloud.ply -po /tmp/aligned_cloud.ply
 
     # Save transform parameters to JSON
     python3 align_reconstructions.py -s source/sparse -t target/sparse \\
@@ -49,7 +53,7 @@ def parse_args():
     parser.add_argument("-t", "--target", required=True, help="Path to target COLMAP sparse directory")
     parser.add_argument("-o", "--output", default=None, help="If set, directory to save transformed source reconstruction (text format)")
     parser.add_argument("-p", "--pointcloud", default=None, help="If set, path to source point cloud (.ply) to transform and save")
-    parser.add_argument("-po", "--pointcloud_output", default=None, help="Output path for transformed point cloud (default: <output>/aligned_pointcloud.ply)")
+    parser.add_argument("-po", "--pointcloud_output", default=None, help="Output path for transformed point cloud (relative to output dir if not absolute, default: <output>/aligned_pointcloud.ply)")
     parser.add_argument("--no_robust_scale", action="store_true", help="Disable robust scale estimation (use RMS ratio)")
     parser.add_argument("-j", "--json", dest="json_out", default=None, help="If set, write transform JSON to this path")
     return parser.parse_args()
@@ -169,7 +173,15 @@ def main():
     if args.pointcloud is not None:
         # Determine output path for point cloud
         if args.pointcloud_output is not None:
-            pointcloud_out = args.pointcloud_output
+            # If pointcloud_output is absolute, use as-is; if relative, make relative to output dir
+            if os.path.isabs(args.pointcloud_output):
+                pointcloud_out = args.pointcloud_output
+            elif args.output is not None:
+                # Relative to output directory
+                pointcloud_out = os.path.join(args.output, args.pointcloud_output)
+            else:
+                # No output dir specified, use relative to current directory
+                pointcloud_out = args.pointcloud_output
         elif args.output is not None:
             pointcloud_out = os.path.join(args.output, "aligned_pointcloud.ply")
         else:

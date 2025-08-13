@@ -10,17 +10,20 @@ VGGT Batch Point Cloud Generation
 Generate point clouds from image sequences using VGGT model with batched processing.
 
 Examples:
-    # Basic usage with short flags
-    python3 generate_batched_pointcloud.py -s images/ -o output/
+    # Basic usage with short flags (output relative to scene directory)
+    python3 generate_batched_pointcloud.py -s scene/ -o output/
 
     # Specify batch size and resolution
-    python3 generate_batched_pointcloud.py -s images/ -o output/ -b 16 -r 512
+    python3 generate_batched_pointcloud.py -s scene/ -o results/ -b 16 -r 512
+
+    # Use absolute output path
+    python3 generate_batched_pointcloud.py -s scene/ -o /tmp/pointclouds/
 
     # Limit number of images and set confidence threshold
-    python3 generate_batched_pointcloud.py -s images/ -o output/ -m 50 -c 1.5
+    python3 generate_batched_pointcloud.py -s scene/ -o output/ -m 50 -c 1.5
 
     # Process with custom settings
-    python3 generate_batched_pointcloud.py -s images/ -o output/ -b 4 -c 2.5 --colormap jet
+    python3 generate_batched_pointcloud.py -s scene/ -o output/ -b 4 -c 2.5 --colormap jet
 """
 
 import random
@@ -51,7 +54,7 @@ from utils.colmap_utils import save_vggt_calibration_as_colmap, save_individual_
 def parse_args():
     parser = argparse.ArgumentParser(description="VGGT Batch Point Cloud Estimation")
     parser.add_argument("-s", "--scene_dir", type=str, required=True, help="Directory containing the scene images")
-    parser.add_argument("-o", "--output_dir", type=str, required=True, help="Directory to save the output point clouds and depth maps")
+    parser.add_argument("-o", "--output_dir", type=str, required=True, help="Directory to save the output point clouds and depth maps (relative to scene_dir if not absolute)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("-r", "--resolution", type=int, default=518, help="Preprocessing resolution. Model always runs at 518.")
     parser.add_argument("-b", "--batch_size", type=int, default=8, help="Number of images to process together.")
@@ -422,7 +425,17 @@ def main():
         raise ValueError(f"No images found in {image_dir}")
     
     image_path_list = sorted(image_path_list)
-    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Handle output directory: if not absolute path, make it relative to scene_dir
+    if os.path.isabs(args.output_dir):
+        output_dir = args.output_dir
+    else:
+        output_dir = os.path.join(args.scene_dir, args.output_dir)
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Update args.output_dir to use the resolved path for consistency
+    args.output_dir = output_dir
     
     print(f"Found {len(image_path_list)} images")
 
