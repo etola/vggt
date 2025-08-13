@@ -32,6 +32,12 @@ This directory contains unit tests for the reconstruction transform functionalit
 - Tests pairwise distance ratios, scale estimation, rigid transforms
 - Covers edge cases, error handling, and end-to-end estimation pipeline
 
+### `test_compatibility_functions.py`
+- **Tests for compatibility wrapper functions**
+- Tests functions added for backward compatibility with legacy code
+- Verifies batch point transformation, point cloud transformation
+- Tests wrapper functions that maintain old API signatures
+
 ## Running Tests
 
 ### Quick Tests (No dependencies needed)
@@ -43,6 +49,9 @@ python3 tests/test_direct_transform.py
 
 # Test similarity transform estimation functions  
 python3 tests/test_estimation_simple.py
+
+# Test compatibility wrapper functions
+python3 tests/test_compatibility_functions.py
 ```
 
 ### Full Test Suite (Requires scipy, pycolmap)
@@ -54,6 +63,9 @@ python3 -m unittest tests.test_reconstruction_transform
 
 # Full estimation tests with synthetic COLMAP data
 python3 -m unittest tests.test_similarity_estimation
+
+# Full compatibility function tests
+python3 tests/test_compatibility_functions.py
 ```
 
 ## Test Coverage
@@ -77,5 +89,12 @@ The tests verify:
 - Special cases (identity, pure scale/translation)
 - Error handling for degenerate configurations
 - Synthetic COLMAP reconstruction alignment
+
+**Compatibility Functions:**
+- Batch point transformation (multiple points at once)
+- Point cloud transformation with color preservation
+- Wrapper functions maintaining legacy API compatibility
+- Empty array handling and edge cases
+- Function signature verification
 
 All tests use high precision (1e-10 tolerance) to ensure numerical accuracy. 

@@ -27,8 +27,8 @@ import torch
 import torch.nn.functional as F
 from scipy.spatial.transform import Rotation as R
 
-# Import functions from utils/similarity_transform.py
-from utils.similarity_transform import (
+# Import functions from utils/reconstruction_transform.py
+from utils.reconstruction_transform import (
     compute_similarity_transform, 
     load_reconstruction, 
     extract_camera_poses,

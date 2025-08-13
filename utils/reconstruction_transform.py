@@ -258,6 +258,75 @@ def apply_similarity_transform_to_point(
     return scale * (rotation @ point) + translation
 
 
+def apply_similarity_transform(points: np.ndarray, transform: Dict) -> np.ndarray:
+    """Apply similarity transform to a set of 3D points.
+    
+    Args:
+        points: Nx3 array of 3D points
+        transform: Transform dict with 'scale', 'rotation', 'translation' keys
+        
+    Returns:
+        Nx3 array of transformed points
+    """
+    if points.shape[0] == 0:
+        return points
+    
+    # Apply scale, rotation, and translation: T(p) = s*R*p + t
+    transformed_points = transform['scale'] * (transform['rotation'] @ points.T).T + transform['translation']
+    return transformed_points
+
+
+def transform_point_cloud_to_colmap_frame(points: np.ndarray, colors: np.ndarray, transform: Dict) -> Tuple[np.ndarray, np.ndarray]:
+    """Transform a point cloud using similarity transform.
+    
+    Args:
+        points: Nx3 array of 3D points
+        colors: Nx3 array of RGB colors (0-255)
+        transform: Transform dict with 'scale', 'rotation', 'translation' keys
+        
+    Returns:
+        tuple: (transformed_points, colors) - colors are unchanged
+    """
+    transformed_points = apply_similarity_transform(points, transform)
+    return transformed_points, colors
+
+
+def compute_similarity_transform(source_sparse_dir: str, target_sparse_dir: str, verbose: bool = True, use_robust: bool = False) -> Dict:
+    """Compute similarity transform between source and target reconstructions.
+    
+    Compatibility wrapper for the original compute_similarity_transform function.
+    
+    Args:
+        source_sparse_dir: Path to source sparse reconstruction directory
+        target_sparse_dir: Path to target sparse reconstruction directory  
+        verbose: Whether to print progress information
+        use_robust: Whether to use robust transform (currently maps to robust_scale)
+        
+    Returns:
+        dict: Similarity transform parameters and statistics
+    """
+    return estimate_similarity_transform_from_recons(
+        source_sparse_dir=source_sparse_dir,
+        target_sparse_dir=target_sparse_dir,
+        robust_scale=use_robust
+    )
+
+
+def extract_camera_poses(reconstruction: pycolmap.Reconstruction) -> Dict[str, Dict[str, np.ndarray]]:
+    """Extract camera poses (positions and orientations) from reconstruction.
+    
+    Compatibility wrapper for extract_camera_centers_and_rotations.
+    
+    Returns:
+        Dict mapping image names to pose info with 'position', 'rotation', 'image_id' keys
+    """
+    poses = extract_camera_centers_and_rotations(reconstruction)
+    # Convert to expected format (rename 'center' to 'position')
+    for name, pose_info in poses.items():
+        pose_info['position'] = pose_info.pop('center')
+    return poses
+
+
 def save_reconstruction_text(reconstruction: pycolmap.Reconstruction, output_dir: str) -> None:
     os.makedirs(output_dir, exist_ok=True)
     reconstruction.write_text(output_dir) 
