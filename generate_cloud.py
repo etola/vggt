@@ -92,9 +92,6 @@ def convert_colmap_intrinsics_to_vggt_format(colmap_intrinsic, depth_width, dept
     """
     Convert COLMAP intrinsics to VGGT format by scaling based on resolution differences.
     
-    COLMAP often stores normalized intrinsics. VGGT expects pixel-space intrinsics with 
-    focal lengths in pixels for the depth map resolution.
-    
     Args:
         colmap_intrinsic: 3x3 intrinsic matrix from COLMAP
         depth_width: Width of the depth map in pixels (e.g., 518)
@@ -104,59 +101,62 @@ def convert_colmap_intrinsics_to_vggt_format(colmap_intrinsic, depth_width, dept
     Returns:
         3x3 intrinsic matrix in VGGT format for depth map resolution
     """
-    # Extract focal lengths and principal point from COLMAP intrinsics
-    fx_colmap = colmap_intrinsic[0, 0]
-    fy_colmap = colmap_intrinsic[1, 1] 
-    cx_colmap = colmap_intrinsic[0, 2]
-    cy_colmap = colmap_intrinsic[1, 2]
+    fx_colmap, fy_colmap = colmap_intrinsic[0, 0], colmap_intrinsic[1, 1]
+    cx_colmap, cy_colmap = colmap_intrinsic[0, 2], colmap_intrinsic[1, 2]
     
-    print(f"🔍 COLMAP intrinsics: fx={fx_colmap:.6f}, fy={fy_colmap:.6f}, cx={cx_colmap:.6f}, cy={cy_colmap:.6f}")
+    print(f"📷 COLMAP intrinsics: fx={fx_colmap:.6f}, fy={fy_colmap:.6f}, cx={cx_colmap:.6f}, cy={cy_colmap:.6f}")
     
-    # Get original image resolution if available
+    # Get original image resolution
     if original_image_path and os.path.exists(original_image_path):
-        from PIL import Image
         with Image.open(original_image_path) as img:
             orig_width, orig_height = img.size
-        print(f"📏 Original image resolution: {orig_width}x{orig_height}")
-        print(f"📏 Depth map resolution: {depth_width}x{depth_height}")
+        print(f"📏 Original image size: {orig_width}x{orig_height}")
     else:
-        # Assume square original image with reasonable resolution
-        orig_width = orig_height = 2048  # Common camera resolution
+        # Fallback to common resolution
+        orig_width, orig_height = 4056, 3040
         print(f"⚠️  Original image not found, assuming {orig_width}x{orig_height}")
-    
-    # Intrinsics appear to be in pixel space already
-    # Check if they're for the original image resolution or depth map resolution
-    # VGGT intrinsics for 518x518 are typically around 850-900 pixels focal length
-    if fx_colmap > depth_width * 2.0:  # Likely for original image (much larger than depth map)
-        print("⚠️  Intrinsics appear to be for original image, scaling to depth map resolution...")
         
-        # Scale from original image to depth map resolution
+    # Check if intrinsics are normalized (typical signs: fx/fy around 1.0, cx/cy around 0.0)
+    if abs(fx_colmap - 1.0) < 0.1 and abs(fy_colmap - 1.0) < 0.1:
+        print("⚠️  Detected normalized intrinsics, converting to pixel space...")
+        
+        # Calculate scale factors from original image to depth map
+        scale_x = depth_width / orig_width
+        scale_y = depth_height / orig_height
+        
+        print(f"📐 Scale factors: x={scale_x:.6f}, y={scale_y:.6f}")
+        
+        # Estimate reasonable focal lengths for the original image
+        fx_orig_estimate = orig_width * 1.66  # Corresponds to ~35° horizontal FOV
+        fy_orig_estimate = orig_height * 1.65  # Corresponds to ~35° vertical FOV
+        
+        # Scale to depth map resolution  
+        fx_vggt = fx_orig_estimate * scale_x
+        fy_vggt = fy_orig_estimate * scale_y
+        cx_vggt = depth_width / 2.0
+        cy_vggt = depth_height / 2.0
+        
+        print(f"🔧 Converted to VGGT format: fx={fx_vggt:.6f}, fy={fy_vggt:.6f}, cx={cx_vggt:.6f}, cy={cy_vggt:.6f}")
+    else:
+        # Intrinsics appear to be in pixel space already
+        # Scale from original image resolution to depth map resolution
         scale_x = depth_width / orig_width
         scale_y = depth_height / orig_height
         
         fx_vggt = fx_colmap * scale_x
         fy_vggt = fy_colmap * scale_y
-        cx_vggt = cx_colmap * scale_x if cx_colmap > 0 else depth_width / 2.0
-        cy_vggt = cy_colmap * scale_y if cy_colmap > 0 else depth_height / 2.0
+        cx_vggt = cx_colmap * scale_x
+        cy_vggt = cy_colmap * scale_y
         
-        print(f"📐 Scale factors: x={scale_x:.6f}, y={scale_y:.6f}")
-        print(f"🔧 Scaled to depth map resolution: fx={fx_vggt:.6f}, fy={fy_vggt:.6f}, cx={cx_vggt:.6f}, cy={cy_vggt:.6f}")
-    else:
-        # Already at depth map resolution (VGGT intrinsics are typically 800-900 for 518x518)
-        fx_vggt = fx_colmap
-        fy_vggt = fy_colmap
-        cx_vggt = cx_colmap if cx_colmap > 0 else depth_width / 2.0
-        cy_vggt = cy_colmap if cy_colmap > 0 else depth_height / 2.0
-        
-        print(f"✅ Using COLMAP intrinsics as-is (already at depth map resolution): fx={fx_vggt:.6f}, fy={fy_vggt:.6f}, cx={cx_vggt:.6f}, cy={cy_vggt:.6f}")
-    
+        print(f"✅ Using COLMAP intrinsics scaled to depth map resolution: fx={fx_vggt:.6f}, fy={fy_vggt:.6f}, cx={cx_vggt:.6f}, cy={cy_vggt:.6f}")
+
     # Construct VGGT-format intrinsic matrix
     vggt_intrinsic = np.array([
         [fx_vggt, 0, cx_vggt],
         [0, fy_vggt, cy_vggt],
         [0, 0, 1]
     ])
-    
+
     return vggt_intrinsic
 
 
@@ -228,21 +228,45 @@ def generate_single_pointcloud(scene_dir, idx, conf_threshold=2.0, vggt_model_re
         # Load camera parameters (either individual or from COLMAP)
         if use_colmap:
             # Load from COLMAP calibration
-            calibration_data = load_calibration_data(colmap_calibration_dir)
+            colmap_subdir_path = os.path.join(scene_dir, colmap_subdir)
+            calibration_data = load_colmap_calibration(colmap_subdir_path)
             
-            # Find camera data for the target image
-            if target_image_name not in calibration_data['images']:
-                raise ValueError(f"No calibration data found for image {target_image_name} in COLMAP")
+            if calibration_data is None:
+                print(f"❌ Failed to load COLMAP calibration from {colmap_subdir_path}")
+                return False
             
-            camera_data = calibration_data['images'][target_image_name]
-            extrinsic = camera_data['extrinsic']  # Shape: [3, 4]
-            colmap_intrinsic = camera_data['intrinsic']  # Shape: [3, 3]
+            print(f"✅ Loaded COLMAP calibration from {colmap_subdir_path}")
             
-            # Convert COLMAP intrinsics to VGGT format  
-            original_image_path = os.path.join(images_dir, target_image_name)
-            intrinsic = convert_colmap_intrinsics_to_vggt_format(
-                colmap_intrinsic, vggt_model_resolution, vggt_model_resolution, original_image_path
-            )
+            # Get extrinsic from COLMAP
+            # Use the actual target image name that was loaded from the images directory
+            if target_image_name in calibration_data['images']:
+                extrinsic = calibration_data['images'][target_image_name]['extrinsic']
+                print(f"✅ Using COLMAP extrinsics for {target_image_name}")
+            else:
+                print(f"❌ Target image {target_image_name} not found in COLMAP calibration")
+                # Print available images for debugging
+                available_images = list(calibration_data['images'].keys())[:5]  # Show first 5
+                print(f"📋 Available images in COLMAP (first 5): {available_images}")
+                return False
+            
+            # Load individual intrinsics from data_subdir
+            base_name = os.path.splitext(target_image_name)[0]  # Remove .jpg extension
+            individual_intrinsics_path = os.path.join(scene_dir, data_subdir, "individual_cameras", f"{base_name}_intrinsic.npy")
+            
+            if os.path.exists(individual_intrinsics_path):
+                intrinsic = np.load(individual_intrinsics_path)
+                print(f"✅ Loaded individual intrinsics from {individual_intrinsics_path}")
+                print(f"📷 Individual intrinsics: fx={intrinsic[0,0]:.2f}, fy={intrinsic[1,1]:.2f}, cx={intrinsic[0,2]:.2f}, cy={intrinsic[1,2]:.2f}")
+            else:
+                print(f"❌ Individual intrinsics not found at {individual_intrinsics_path}")
+                print(f"🔄 Falling back to COLMAP intrinsics...")
+                
+                # Fallback to COLMAP intrinsics with conversion
+                colmap_intrinsic = calibration_data['images'][target_image_name]['intrinsic']
+                intrinsic = convert_colmap_intrinsics_to_vggt_format(
+                    colmap_intrinsic, vggt_model_resolution, vggt_model_resolution,
+                    original_image_path=os.path.join(scene_dir, "images", target_image_name)
+                )
         else:
             # Load individual camera parameters
             from utils.colmap_utils import load_individual_camera_parameters
