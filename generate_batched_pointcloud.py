@@ -16,6 +16,15 @@ Batching Strategies:
        reference calibration, creating batches with better visual overlap
     2. Sequential: Traditional approach processing images in order
 
+Point Cloud Computation:
+    - Uses VGGT intrinsics with reference calibration extrinsics for unprojection
+    - Saves VGGT extrinsics to colmap_calibration/ for scale estimation against reference
+    - Scales VGGT depth maps with estimated scale before unprojection 
+    - Recomputes point clouds with scaled depth maps and reference extrinsics
+    - Sets transform scale to 1.0 (no additional scaling needed)
+    - Saves reference extrinsics to transformed/ as final output
+    - Results are directly in reference coordinate system with correct scale
+
 Output Structure:
     output_dir/
     ├── pointcloud.ply               # Global combined point cloud (all batches)
@@ -27,10 +36,10 @@ Output Structure:
     │   ├── depth/                   # Colorized depth maps (.png)
     │   ├── raw_data/                # Raw depth & confidence (.npy)
     │   ├── individual_cameras/      # Camera parameters (.npy)
-    │   ├── colmap_calibration/      # COLMAP format calibration
-    │   ├── transformed/             # Similarity transform results
+    │   ├── colmap_calibration/      # VGGT calibration (for scale estimation)
+    │   ├── transformed/             # Reference calibration & transform results
     │   │   ├── transform.json       # Transform parameters
-    │   │   ├── cameras.txt          # Transformed COLMAP calibration
+    │   │   ├── cameras.txt          # Reference COLMAP calibration (final output)
     │   │   ├── images.txt
     │   │   ├── points3D.txt
     │   │   └── ply/                 # Transformed point clouds
@@ -145,7 +154,8 @@ def colorize_depth_map(depth, cmap='viridis', min_percentile=5, max_percentile=9
 
 def run_VGGT_batch_pointcloud(model, images_batch, dtype, vggt_model_resolution=518):
     """
-    Run VGGT for a batch of images to get point clouds and depth maps.
+    Run VGGT for a batch of images to get depth maps and camera parameters.
+    Note: Point clouds are computed separately using reference extrinsics.
     
     Args:
         model: VGGT model with camera and depth heads enabled
@@ -154,12 +164,12 @@ def run_VGGT_batch_pointcloud(model, images_batch, dtype, vggt_model_resolution=
         vggt_model_resolution: Fixed resolution for VGGT model (518)
     
     Returns:
-        points_3d: Numpy array of 3D points [B, H, W, 3]
+        points_3d: Numpy array of 3D points [B, H, W, 3] (computed with VGGT extrinsics, will be replaced)
         depth_conf: Numpy array of depth confidence [B, H, W]
         depth_map: Numpy array of depth maps [B, H, W, 1]
         images_for_color: Torch tensor of images for coloring points [B, 3, H, W]
-        extrinsic: Camera extrinsic matrices [B, 3, 4]
-        intrinsic: Camera intrinsic matrices [B, 3, 3]
+        extrinsic: VGGT Camera extrinsic matrices [B, 3, 4] (not used for final point clouds)
+        intrinsic: VGGT Camera intrinsic matrices [B, 3, 3] (used for final point clouds)
     """
     with torch.no_grad():
         with torch.amp.autocast('cuda', dtype=dtype):
@@ -415,6 +425,78 @@ def create_neighbor_based_batches(image_paths, point_sharing_info, batch_size):
     return batches
 
 
+def load_reference_extrinsics_for_batch(batch_image_names, reference_calibration_dir):
+    """
+    Load reference calibration extrinsics for the given batch images.
+    
+    Args:
+        batch_image_names: List of image names in the batch
+        reference_calibration_dir: Path to reference COLMAP reconstruction
+    
+    Returns:
+        np.ndarray: Array of extrinsic matrices [B, 3, 4]
+    """
+    try:
+        # Load reference reconstruction
+        from utils.colmap_utils import load_colmap_calibration
+        reference_data = load_colmap_calibration(reference_calibration_dir)
+        
+        if reference_data is None:
+            raise ValueError(f"Failed to load reference calibration from {reference_calibration_dir}")
+        
+        reference_images = reference_data['images']
+        extrinsics_list = []
+        
+        for image_name in batch_image_names:
+            if image_name in reference_images:
+                extrinsic = reference_images[image_name]['extrinsic']
+                extrinsics_list.append(extrinsic)
+                print(f"    ✅ {image_name}: Found reference extrinsic")
+            else:
+                raise ValueError(f"Image {image_name} not found in reference calibration")
+        
+        # Stack into batch format [B, 3, 4]
+        reference_extrinsics = np.stack(extrinsics_list, axis=0)
+        
+        print(f"  ✅ Loaded reference extrinsics for {len(batch_image_names)} images")
+        return reference_extrinsics
+        
+    except Exception as e:
+        print(f"  ❌ Error loading reference extrinsics: {e}")
+        raise
+
+
+def recompute_pointclouds_with_reference_extrinsics(depth_maps, intrinsics, reference_extrinsics):
+    """
+    Recompute 3D point clouds using VGGT depth maps and intrinsics with reference extrinsics.
+    
+    Args:
+        depth_maps: VGGT depth maps [B, H, W]
+        intrinsics: VGGT intrinsic matrices [B, 3, 3]
+        reference_extrinsics: Reference extrinsic matrices [B, 3, 4]
+    
+    Returns:
+        np.ndarray: 3D points [B, H, W, 3]
+    """
+    try:
+        # Add channel dimension for unprojection: [B, H, W] -> [B, H, W, 1]
+        depth_maps_for_unproject = depth_maps[..., None]
+        
+        # Unproject using reference extrinsics and VGGT intrinsics
+        points_3d = unproject_depth_map_to_point_map(
+            depth_maps_for_unproject, reference_extrinsics, intrinsics
+        )
+        
+        print(f"  ✅ Recomputed point clouds using reference extrinsics")
+        print(f"     Shape: {points_3d.shape}")
+        
+        return points_3d
+        
+    except Exception as e:
+        print(f"  ❌ Error recomputing point clouds: {e}")
+        raise
+
+
 def process_images_for_pointclouds(model, image_paths, dtype, args):
     """
     Process images in batches to generate and save point clouds and depth maps.
@@ -482,13 +564,23 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         images_for_model = F.interpolate(images, size=(vggt_model_resolution, vggt_model_resolution), mode="bilinear", align_corners=False)
         images_for_model = images_for_model.to(next(model.parameters()).device)
 
-        # Process batch to get point clouds and depth maps
-        points_3d_batch, depth_conf_batch, depth_map_batch, images_for_color, extrinsic_batch, intrinsic_batch = run_VGGT_batch_pointcloud(
+        # Get batch image names for reference loading and similarity transform
+        batch_image_names = [os.path.basename(p) for p in batch_paths]
+        
+        # Process batch to get depth maps and VGGT intrinsics
+        points_3d_batch, depth_conf_batch, depth_map_batch, images_for_color, vggt_extrinsic_batch, intrinsic_batch = run_VGGT_batch_pointcloud(
             model, images_for_model, dtype, vggt_model_resolution
         )
         
-        # Get batch image names for similarity transform and saving
-        batch_image_names = [os.path.basename(p) for p in batch_paths]
+        # Load reference calibration extrinsics for the batch images
+        print(f"  🔄 Loading reference extrinsics for batch images...")
+        reference_extrinsics = load_reference_extrinsics_for_batch(batch_image_names, args.reference_calibration)
+        
+        # Recompute point clouds using VGGT intrinsics but reference extrinsics
+        print(f"  🔄 Recomputing point clouds with reference extrinsics...")
+        points_3d_batch = recompute_pointclouds_with_reference_extrinsics(
+            depth_map_batch, intrinsic_batch, reference_extrinsics
+        )
         
         # Save raw data if requested
         if args.save_raw_data:
@@ -504,24 +596,56 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
                 print(f"  Saved raw depth map to {depth_file}")
                 print(f"  Saved confidence map to {conf_file}")
         
-        # Save COLMAP format calibration (directly in colmap_calibration directory)
+        # Save COLMAP format calibration (using VGGT extrinsics + intrinsics for scale estimation)
         save_vggt_calibration_as_colmap(
-            [extrinsic_batch], [intrinsic_batch], [batch_image_names], 
+            [vggt_extrinsic_batch], [intrinsic_batch], [batch_image_names], 
             colmap_dir, vggt_model_resolution
         )
         
-        # Save individual camera parameters (for generate_cloud.py)
+        # Save individual camera parameters (for generate_cloud.py) - using VGGT extrinsics
         if args.save_raw_data:
-            save_individual_camera_parameters(extrinsic_batch, intrinsic_batch, batch_image_names, individual_cameras_dir)
+            save_individual_camera_parameters(vggt_extrinsic_batch, intrinsic_batch, batch_image_names, individual_cameras_dir)
         
 
         # compute the similarity transform from the batch to the reference calibration
-        transform = get_batch_transform(colmap_dir, args.reference_calibration, transformed_dir)
+        full_transform = get_batch_transform(colmap_dir, args.reference_calibration, transformed_dir)
+        estimated_scale = full_transform['scale']
+        
+        print(f"  📐 Estimated scale: {estimated_scale:.6f}")
+        print(f"  🔄 Scaling depth maps before point cloud computation...")
+        
+        # Scale the depth maps with the estimated scale
+        scaled_depth_maps = depth_map_batch * estimated_scale
+        
+        # Recompute point clouds using scaled depth maps with reference extrinsics  
+        print(f"  🔄 Recomputing point clouds with scaled depth maps...")
+        points_3d_batch = recompute_pointclouds_with_reference_extrinsics(
+            scaled_depth_maps, intrinsic_batch, reference_extrinsics
+        )
+        
+        # Set transform scale to 1 since depth maps are already scaled
+        transform = {
+            'scale': 1.0,  # No additional scaling needed
+            'rotation': np.eye(3),  # Identity matrix
+            'translation': np.zeros(3),  # Zero translation
+            'rmse': full_transform['rmse'],
+            'num_common': full_transform['num_common'],
+            'common_images': full_transform['common_images']
+        }
+        
+        print(f"  ✅ Transform scale set to 1.0 (depth maps already scaled)")
         
         # Create transformed point clouds directory
         transformed_ply_dir = os.path.join(transformed_dir, "ply")
         os.makedirs(transformed_ply_dir, exist_ok=True)
 
+        # Save reference extrinsics to transformed directory as the final output
+        print(f"  💾 Saving reference extrinsics to transformed directory...")
+        save_vggt_calibration_as_colmap(
+            [reference_extrinsics], [intrinsic_batch], [batch_image_names], 
+            transformed_dir, vggt_model_resolution
+        )
+        print(f"  ✅ Saved reference calibration as final transformed output")
 
         # --- Save Combined Batch Point Cloud ---
         # Flatten all points and confidences from the batch
@@ -562,23 +686,19 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         combined_pc.export(combined_ply_path)
         print(f"  Saved combined batch with {combined_filtered_points.shape[0]} points to {combined_ply_path}")
         
-        # Transform and save the combined point cloud using the computed similarity transform
+        # Save the combined point cloud to transformed directory (no additional transformation needed)
         if combined_filtered_points.shape[0] > 0:
             try:
-                transformed_combined_points, transformed_combined_colors = transform_point_cloud_to_colmap_frame(
-                    combined_filtered_points, combined_filtered_colors, transform
-                )
-                
-                # Save transformed combined point cloud
+                # No transformation needed since points are already correctly scaled and positioned
                 transformed_combined_path = os.path.join(transformed_ply_dir, "combined.ply")
-                transformed_combined_pc = trimesh.PointCloud(vertices=transformed_combined_points, colors=transformed_combined_colors)
+                transformed_combined_pc = trimesh.PointCloud(vertices=combined_filtered_points, colors=combined_filtered_colors)
                 transformed_combined_pc.export(transformed_combined_path)
-                print(f"  Saved transformed combined batch with {transformed_combined_points.shape[0]} points to {transformed_combined_path}")
+                print(f"  Saved final combined batch with {combined_filtered_points.shape[0]} points to {transformed_combined_path}")
                 
             except Exception as e:
-                print(f"  ⚠️  Warning: Failed to transform combined point cloud: {e}")
+                print(f"  ⚠️  Warning: Failed to save final point cloud: {e}")
         else:
-            print(f"  ⚠️  No points in combined batch, skipping transformation")
+            print(f"  ⚠️  No points in combined batch, skipping save")
         
         # --- Save Individual Frame Outputs ---
         # Save one point cloud and one depth map per frame in the batch
@@ -619,21 +739,17 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
             point_cloud.export(output_filename)
             print(f"  Saved {filtered_points.shape[0]} points to {output_filename}")
             
-            # Transform and save individual point cloud using the computed similarity transform
+            # Save individual point cloud to transformed directory (no additional transformation needed)
             if filtered_points.shape[0] > 0:
                 try:
-                    transformed_points, transformed_colors = transform_point_cloud_to_colmap_frame(
-                        filtered_points, filtered_colors, transform
-                    )
-                    
-                    # Save transformed individual point cloud
+                    # No transformation needed since points are already correctly scaled and positioned
                     transformed_output_filename = os.path.join(transformed_ply_dir, f"{file_name_no_ext}.ply")
-                    transformed_point_cloud = trimesh.PointCloud(vertices=transformed_points, colors=transformed_colors)
+                    transformed_point_cloud = trimesh.PointCloud(vertices=filtered_points, colors=filtered_colors)
                     transformed_point_cloud.export(transformed_output_filename)
-                    print(f"  Saved transformed {transformed_points.shape[0]} points to {transformed_output_filename}")
+                    print(f"  Saved final {filtered_points.shape[0]} points to {transformed_output_filename}")
                     
                 except Exception as e:
-                    print(f"  ⚠️  Warning: Failed to transform point cloud for {file_name_no_ext}: {e}")
+                    print(f"  ⚠️  Warning: Failed to save final point cloud for {file_name_no_ext}: {e}")
             else:
                 print(f"  No points passed confidence threshold for {file_name_no_ext}")
             
