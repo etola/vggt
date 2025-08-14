@@ -162,7 +162,7 @@ def colorize_depth_map(depth, cmap='viridis', min_percentile=5, max_percentile=9
 def run_VGGT_batch_pointcloud(model, images_batch, dtype, vggt_model_resolution=518):
     """
     Run VGGT for a batch of images to get depth maps and camera parameters.
-    Note: Point clouds are computed separately using reference extrinsics.
+    Point clouds are computed separately later using scaled depth maps and reference extrinsics.
     
     Args:
         model: VGGT model with camera and depth heads enabled
@@ -171,11 +171,10 @@ def run_VGGT_batch_pointcloud(model, images_batch, dtype, vggt_model_resolution=
         vggt_model_resolution: Fixed resolution for VGGT model (518)
     
     Returns:
-        points_3d: Numpy array of 3D points [B, H, W, 3] (computed with VGGT extrinsics, will be replaced)
         depth_conf: Numpy array of depth confidence [B, H, W]
-        depth_map: Numpy array of depth maps [B, H, W, 1]
+        depth_map: Numpy array of depth maps [B, H, W]
         images_for_color: Torch tensor of images for coloring points [B, 3, H, W]
-        extrinsic: VGGT Camera extrinsic matrices [B, 3, 4] (not used for final point clouds)
+        extrinsic: VGGT Camera extrinsic matrices [B, 3, 4] (saved for scale estimation)
         intrinsic: VGGT Camera intrinsic matrices [B, 3, 3] (used for final point clouds)
     """
     with torch.no_grad():
@@ -198,12 +197,7 @@ def run_VGGT_batch_pointcloud(model, images_batch, dtype, vggt_model_resolution=
     depth_map_np = depth_map.squeeze(-1).squeeze(0).cpu().numpy()   # Shape: [S, H, W]
     depth_conf_np = depth_conf.squeeze(0).cpu().numpy() # Shape: [S, H, W]
 
-    # 3. Unproject depth to get 3D points
-    # Add the channel dimension back for unprojection
-    depth_map_for_unproject = depth_map_np[..., None]  # [S, H, W, 1]
-    points_3d = unproject_depth_map_to_point_map(depth_map_for_unproject, extrinsic_np, intrinsic_np)
-    
-    return points_3d, depth_conf_np, depth_map_np, images_batch.cpu(), extrinsic_np, intrinsic_np
+    return depth_conf_np, depth_map_np, images_batch.cpu(), extrinsic_np, intrinsic_np
 
 
 
@@ -440,9 +434,9 @@ def load_reference_extrinsics_for_batch(batch_image_names, reference_calibration
         raise
 
 
-def recompute_pointclouds_with_reference_extrinsics(depth_maps, intrinsics, reference_extrinsics):
+def compute_pointclouds_with_reference_extrinsics(depth_maps, intrinsics, reference_extrinsics):
     """
-    Recompute 3D point clouds using VGGT depth maps and intrinsics with reference extrinsics.
+    Compute 3D point clouds using VGGT depth maps and intrinsics with reference extrinsics.
     
     Args:
         depth_maps: VGGT depth maps [B, H, W]
@@ -461,7 +455,7 @@ def recompute_pointclouds_with_reference_extrinsics(depth_maps, intrinsics, refe
             depth_maps_for_unproject, reference_extrinsics, intrinsics
         )
         
-        print(f"  ✅ Recomputed point clouds using reference extrinsics")
+        print(f"  ✅ Computed point clouds using reference extrinsics")
         print(f"     Shape: {points_3d.shape}")
         
         return points_3d
@@ -550,7 +544,7 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         batch_image_names = [os.path.basename(p) for p in batch_paths]
         
         # Process batch to get depth maps and VGGT intrinsics
-        points_3d_batch, depth_conf_batch, depth_map_batch, images_for_color, vggt_extrinsic_batch, intrinsic_batch = run_VGGT_batch_pointcloud(
+        depth_conf_batch, depth_map_batch, images_for_color, vggt_extrinsic_batch, intrinsic_batch = run_VGGT_batch_pointcloud(
             model, images_for_model, dtype, vggt_model_resolution
         )
         
@@ -613,8 +607,8 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         scaled_depth_maps = depth_map_batch * estimated_scale
         
         # Recompute point clouds using scaled depth maps with reference extrinsics  
-        print(f"  🔄 Recomputing point clouds with scaled depth maps...")
-        points_3d_batch = recompute_pointclouds_with_reference_extrinsics(
+        print(f"  🔄 Computing point clouds with scaled depth maps...")
+        points_3d_batch = compute_pointclouds_with_reference_extrinsics(
             scaled_depth_maps, intrinsic_batch, reference_extrinsics
         )
         
