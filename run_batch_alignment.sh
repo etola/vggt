@@ -1,39 +1,34 @@
 #!/bin/bash
 
-# Batch alignment script for VGGT2 reconstruction data
-# Aligns batches 000 through 033 to the target reconstruction
+# Batch alignment script for VGGT reconstruction data
+# Aligns batches to the target reconstruction using the new batch-organized structure
 #
 # Usage:
 #   ./run_batch_alignment.sh
 #
 # This script will:
-#   1. Process batches 000 through 033
+#   1. Auto-discover available batch directories in the work folder
 #   2. Align each batch to the target reconstruction 
-#   3. Transform point clouds and save to output directory
+#   3. Transform point clouds and save to batch-specific output directory
 #   4. Provide detailed progress and summary statistics
 #
 # Requirements:
-#   - Source directories: ~/data/yamac/vggt2/colmap_calibration/batch_XXX/
-#   - Point cloud files: ~/data/yamac/vggt2/ply/batch_XXX_combined.ply
+#   - Work folder: ~/data/yamac/vggt8/
+#   - Batch directories: ~/data/yamac/vggt8/batch_XXX/
+#   - Source directories: ~/data/yamac/vggt8/batch_XXX/colmap_calibration/
+#   - Point cloud files: ~/data/yamac/vggt8/batch_XXX/ply/combined.ply
 #   - Target reconstruction: ~/data/yamac/glomap/sparse/0/
 #
 # Output:
-#   - Transformed reconstructions: ~/data/yamac/vggt2/transformed/
-#   - Aligned point clouds: ~/data/yamac/vggt2/transformed/aligned_XXX.ply
-#   - Validation results for each batch
+#   - Transformed reconstructions: ~/data/yamac/vggt8/batch_XXX/transformed/
+#   - Progress and validation results for each batch
 
 # Note: We don't use 'set -e' because we want to continue processing other batches 
 # even if some individual batches fail
 
 # Configuration
-SOURCE_BASE="$HOME/data/yamac/vggt8/colmap_calibration/batch_"
+WORK_FOLDER="$HOME/data/yamac/vggt8"
 TARGET_DIR="$HOME/data/yamac/glomap/sparse/0/"
-OUTPUT_DIR="$HOME/data/yamac/vggt8/transformed"
-PLY_BASE="$HOME/data/yamac/vggt8/ply/batch_"
-PLY_SUFFIX="_combined.ply"
-
-# Ensure output directory exists
-mkdir -p "$OUTPUT_DIR"
 
 # Colors for output
 RED='\033[0;31m'
@@ -43,27 +38,43 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 echo -e "${BLUE}Starting batch alignment process...${NC}"
-echo -e "${BLUE}Source base: ${SOURCE_BASE}XXX/${NC}"
+echo -e "${BLUE}Work folder: ${WORK_FOLDER}${NC}"
 echo -e "${BLUE}Target: ${TARGET_DIR}${NC}"
-echo -e "${BLUE}Output: ${OUTPUT_DIR}${NC}"
-echo -e "${BLUE}Point cloud base: ${PLY_BASE}XXX${PLY_SUFFIX}${NC}"
+echo -e "${BLUE}Batch structure: batch_XXX/colmap_calibration/, batch_XXX/ply/combined.ply${NC}"
+echo ""
+
+# Auto-discover available batches
+echo -e "${YELLOW}Auto-discovering available batch directories...${NC}"
+batch_dirs=($(find "$WORK_FOLDER" -maxdepth 1 -type d -name "batch_*" | sort))
+
+if [ ${#batch_dirs[@]} -eq 0 ]; then
+    echo -e "${RED}ERROR: No batch directories found in $WORK_FOLDER${NC}"
+    echo -e "${RED}Expected directories like: batch_000/, batch_001/, etc.${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}Found ${#batch_dirs[@]} batch directories:${NC}"
+for batch_dir in "${batch_dirs[@]}"; do
+    batch_name=$(basename "$batch_dir")
+    echo -e "  - $batch_name"
+done
 echo ""
 
 # Initialize counters
-total_batches=34  # 000 to 033 inclusive
+total_batches=${#batch_dirs[@]}
 successful=0
 failed=0
 
 # Function to run alignment for a single batch
 run_alignment() {
-    local batch_num=$1
-    local batch_id=$(printf "%03d" $batch_num)
+    local batch_dir=$1
+    local batch_name=$(basename "$batch_dir")
     
-    local source_dir="${SOURCE_BASE}${batch_id}/"
-    local ply_file="${PLY_BASE}${batch_id}${PLY_SUFFIX}"
-    local output_ply="aligned_${batch_id}.ply"
+    local source_dir="${batch_dir}/colmap_calibration/"
+    local ply_file="${batch_dir}/ply/combined.ply"
+    local output_dir="${batch_dir}/transformed"
     
-    echo -e "${YELLOW}Processing batch ${batch_id}...${NC}"
+    echo -e "${YELLOW}Processing ${batch_name}...${NC}"
     
     # Check if source directory exists
     if [ ! -d "$source_dir" ]; then
@@ -77,37 +88,42 @@ run_alignment() {
         return 1
     fi
     
+    # Ensure output directory exists
+    mkdir -p "$output_dir"
+    
     # Run the alignment command
-    echo "  Command: python align_reconstructions.py -s $source_dir -t $TARGET_DIR -o $OUTPUT_DIR -p $ply_file -po $output_ply"
+    echo "  Command: python align_reconstructions.py -s $source_dir -t $TARGET_DIR -o $output_dir -p $ply_file"
     
     if python align_reconstructions.py \
         -s "$source_dir" \
         -t "$TARGET_DIR" \
-        -o "$OUTPUT_DIR" \
-        -p "$ply_file" \
-        -po "$output_ply"; then
-        echo -e "${GREEN}✓ Batch ${batch_id} completed successfully${NC}"
+        -o "$output_dir" \
+        -p "$ply_file"; then
+        echo -e "${GREEN}✓ ${batch_name} completed successfully${NC}"
         return 0
     else
-        echo -e "${RED}✗ Batch ${batch_id} failed${NC}"
+        echo -e "${RED}✗ ${batch_name} failed${NC}"
         return 1
     fi
 }
 
 # Main processing loop
-echo -e "${BLUE}Processing batches 000 through 033...${NC}"
+echo -e "${BLUE}Processing discovered batches...${NC}"
 echo ""
 
-for i in {0..33}; do
-    batch_id=$(printf "%03d" $i)
-    echo -e "${BLUE}=== BATCH ${batch_id} ($(($i + 1))/${total_batches}) ===${NC}"
+batch_count=0
+for batch_dir in "${batch_dirs[@]}"; do
+    batch_count=$((batch_count + 1))
+    batch_name=$(basename "$batch_dir")
     
-    if run_alignment $i; then
+    echo -e "${BLUE}=== $batch_name ($batch_count/$total_batches) ===${NC}"
+    
+    if run_alignment "$batch_dir"; then
         successful=$((successful + 1))
-        echo -e "${GREEN}Batch ${batch_id} marked as successful. Running total: ${successful}${NC}"
+        echo -e "${GREEN}${batch_name} marked as successful. Running total: ${successful}${NC}"
     else
         failed=$((failed + 1))
-        echo -e "${RED}Batch ${batch_id} marked as failed. Running total: ${failed}${NC}"
+        echo -e "${RED}${batch_name} marked as failed. Running total: ${failed}${NC}"
     fi
     
     echo -e "${YELLOW}Continuing to next batch...${NC}"

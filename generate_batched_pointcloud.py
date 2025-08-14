@@ -8,6 +8,24 @@
 VGGT Batch Point Cloud Generation
 
 Generate point clouds from image sequences using VGGT model with batched processing.
+Each batch creates its own directory containing all related assets (point clouds, 
+depth maps, camera calibration, etc.) for easy organization and processing.
+
+Output Structure:
+    output_dir/
+    ├── batch_000/
+    │   ├── ply/                     # Point clouds (.ply files)
+    │   │   ├── combined.ply         # All batch images combined
+    │   │   ├── image1.ply           # Individual image point clouds
+    │   │   └── image2.ply
+    │   ├── depth/                   # Colorized depth maps (.png)
+    │   ├── raw_data/                # Raw depth & confidence (.npy)
+    │   ├── individual_cameras/      # Camera parameters (.npy)
+    │   ├── colmap_calibration/      # COLMAP format calibration
+    │   └── batch_metadata.json     # Batch processing info
+    ├── batch_001/
+    │   └── ...
+    └── processing_metadata.json    # Overall processing info
 
 Examples:
     # Basic usage with short flags (output relative to scene directory)
@@ -52,7 +70,7 @@ from utils.colmap_utils import save_vggt_calibration_as_colmap, save_individual_
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="VGGT Batch Point Cloud Estimation")
+    parser = argparse.ArgumentParser(description="VGGT Batch Point Estimation")
     parser.add_argument("-s", "--scene_dir", type=str, required=True, help="Directory containing the scene images")
     parser.add_argument("-o", "--output_dir", type=str, required=True, help="Directory to save the output point clouds and depth maps (relative to scene_dir if not absolute)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
@@ -141,19 +159,9 @@ def run_VGGT_batch_pointcloud(model, images_batch, dtype, vggt_model_resolution=
 def process_images_for_pointclouds(model, image_paths, dtype, args):
     """
     Process images in batches to generate and save point clouds and depth maps.
+    Each batch gets its own directory with all related assets.
     """
     vggt_model_resolution = 518
-    
-    ply_output_dir = os.path.join(args.output_dir, "ply")
-    depth_output_dir = os.path.join(args.output_dir, "depth")
-    raw_data_dir = os.path.join(args.output_dir, "raw_data")
-    colmap_dir = os.path.join(args.output_dir, "colmap_calibration")
-    
-    os.makedirs(ply_output_dir, exist_ok=True)
-    os.makedirs(depth_output_dir, exist_ok=True)
-    if args.save_raw_data:
-        os.makedirs(raw_data_dir, exist_ok=True)
-    os.makedirs(colmap_dir, exist_ok=True)
     
     # Limit number of images if specified
     if args.max_images is not None:
@@ -171,6 +179,21 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         batch_paths = image_paths[start_idx:end_idx]
         
         print(f"Processing batch {batch_idx + 1}/{num_batches}: images {start_idx + 1}-{end_idx}")
+        
+        # Create batch-specific directory structure
+        batch_dir = os.path.join(args.output_dir, f"batch_{batch_idx:03d}")
+        ply_output_dir = os.path.join(batch_dir, "ply")
+        depth_output_dir = os.path.join(batch_dir, "depth")
+        raw_data_dir = os.path.join(batch_dir, "raw_data")
+        colmap_dir = os.path.join(batch_dir, "colmap_calibration")
+        individual_cameras_dir = os.path.join(batch_dir, "individual_cameras")
+        
+        os.makedirs(ply_output_dir, exist_ok=True)
+        os.makedirs(depth_output_dir, exist_ok=True)
+        if args.save_raw_data:
+            os.makedirs(raw_data_dir, exist_ok=True)
+            os.makedirs(individual_cameras_dir, exist_ok=True)
+        os.makedirs(colmap_dir, exist_ok=True)
         
         # Load batch with aspect-ratio preservation
         images, _ = load_and_preprocess_images_square(batch_paths, args.resolution)
@@ -201,15 +224,13 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
                 print(f"  Saved raw depth map to {depth_file}")
                 print(f"  Saved confidence map to {conf_file}")
         
-        # Save COLMAP format calibration
-        colmap_batch_dir = os.path.join(colmap_dir, f"batch_{batch_idx:03d}")
+        # Save COLMAP format calibration (directly in colmap_calibration directory)
         save_vggt_calibration_as_colmap(
             [extrinsic_batch], [intrinsic_batch], [batch_image_names], 
-            colmap_batch_dir, vggt_model_resolution
+            colmap_dir, vggt_model_resolution
         )
         
         # Save individual camera parameters (for generate_cloud.py)
-        individual_cameras_dir = os.path.join(args.output_dir, "individual_cameras")
         if args.save_raw_data:
             save_individual_camera_parameters(extrinsic_batch, intrinsic_batch, batch_image_names, individual_cameras_dir)
         
@@ -226,7 +247,7 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         combined_filtered_colors = batch_colors_flat[combined_conf_mask]
         
         # Save the combined point cloud
-        combined_ply_path = os.path.join(ply_output_dir, f"batch_{batch_idx:03d}_combined.ply")
+        combined_ply_path = os.path.join(ply_output_dir, "combined.ply")
         combined_pc = trimesh.PointCloud(vertices=combined_filtered_points, colors=combined_filtered_colors)
         combined_pc.export(combined_ply_path)
         print(f"  Saved combined batch with {combined_filtered_points.shape[0]} points to {combined_ply_path}")
@@ -268,18 +289,72 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
             Image.fromarray(colored_depth).save(depth_output_filename)
             print(f"  Saved depth map to {depth_output_filename}")
 
+        # Save batch-specific metadata
+        save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_idx)
+
         # Aggressive memory cleanup
         del images, images_for_model, points_3d_batch, depth_conf_batch, depth_map_batch, images_for_color
         torch.cuda.empty_cache()
         gc.collect()
     
-    # Save processing metadata
+    # Save overall processing metadata
     save_processing_metadata(args, image_paths, args.output_dir)
+
+
+def save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_idx):
+    """Save metadata for a single batch."""
+    import json
+    
+    batch_metadata = {
+        'batch_index': batch_idx,
+        'image_names': batch_image_names,
+        'image_paths': batch_paths,
+        'total_images_in_batch': len(batch_paths),
+        'batch_directory': batch_dir,
+        'processing_parameters': {
+            'scene_dir': args.scene_dir,
+            'output_dir': args.output_dir,
+            'seed': args.seed,
+            'resolution': args.resolution,
+            'batch_size': args.batch_size,
+            'max_images': args.max_images,
+            'conf_threshold': args.conf_threshold,
+            'colormap': args.colormap,
+            'save_raw_data': args.save_raw_data,
+            'vggt_model_resolution': 518
+        },
+        'file_structure': {
+            'ply_dir': 'ply/',
+            'depth_dir': 'depth/',
+            'raw_data_dir': 'raw_data/' if args.save_raw_data else None,
+            'individual_cameras_dir': 'individual_cameras/' if args.save_raw_data else None,
+            'colmap_calibration_dir': 'colmap_calibration/'
+        },
+        'file_formats': {
+            'point_clouds': '.ply (trimesh format)',
+            'combined_point_cloud': 'combined.ply (all batch images combined)',
+            'depth_maps': '.png (colorized visualization)',
+            'raw_depth': '.npy (numpy array, float32)',
+            'confidence': '.npy (numpy array, float32)',
+            'extrinsics': '.npy (numpy array, shape [3, 4])',
+            'intrinsics': '.npy (numpy array, shape [3, 3])',
+            'colmap_calibration': 'COLMAP sparse reconstruction format (cameras.txt, images.txt, points3D.txt)'
+        }
+    }
+    
+    metadata_file = os.path.join(batch_dir, 'batch_metadata.json')
+    with open(metadata_file, 'w') as f:
+        json.dump(batch_metadata, f, indent=2)
+    
+    print(f"  Batch metadata saved to {metadata_file}")
 
 
 def save_processing_metadata(args, image_paths, output_dir):
     """Save metadata about the processing parameters and file structure."""
     import json
+    
+    # Calculate batch information
+    num_batches = (len(image_paths) + args.batch_size - 1) // args.batch_size
     
     metadata = {
         'processing_parameters': {
@@ -294,15 +369,22 @@ def save_processing_metadata(args, image_paths, output_dir):
             'save_raw_data': args.save_raw_data,
             'vggt_model_resolution': 518
         },
-        'file_structure': {
+        'batch_organization': {
+            'total_batches': num_batches,
+            'batch_directory_pattern': 'batch_XXX/',
+            'description': 'Each batch has its own directory containing all related assets'
+        },
+        'file_structure_per_batch': {
             'ply_dir': 'ply/',
             'depth_dir': 'depth/',
             'raw_data_dir': 'raw_data/' if args.save_raw_data else None,
-            'cameras_dir': 'cameras/',
-            'colmap_calibration_dir': 'colmap_calibration/'
+            'individual_cameras_dir': 'individual_cameras/' if args.save_raw_data else None,
+            'colmap_calibration_dir': 'colmap_calibration/',
+            'batch_metadata': 'batch_metadata.json'
         },
         'file_formats': {
             'point_clouds': '.ply (trimesh format)',
+            'combined_point_cloud': 'combined.ply (all batch images combined)',
             'depth_maps': '.png (colorized visualization)',
             'raw_depth': '.npy (numpy array, float32)',
             'confidence': '.npy (numpy array, float32)',
@@ -312,11 +394,10 @@ def save_processing_metadata(args, image_paths, output_dir):
         },
         'data_info': {
             'total_images_processed': len(image_paths),
+            'total_batches': num_batches,
             'image_names': [os.path.basename(p) for p in image_paths]
         }
     }
-    
-
     
     metadata_file = os.path.join(output_dir, 'processing_metadata.json')
     with open(metadata_file, 'w') as f:
@@ -325,12 +406,47 @@ def save_processing_metadata(args, image_paths, output_dir):
     print(f"Processing metadata saved to {metadata_file}")
 
 
-def load_vggt_data(data_dir, image_name):
+def find_image_batch(data_dir, image_name):
     """
-    Load VGGT data for a specific image.
+    Find which batch directory contains the specified image.
     
     Args:
-        data_dir: Directory containing the VGGT output
+        data_dir: Root VGGT output directory
+        image_name: Name of the image (without extension)
+    
+    Returns:
+        str or None: Path to the batch directory containing the image, or None if not found
+    """
+    import json
+    
+    # Look through batch directories
+    batch_dirs = [d for d in os.listdir(data_dir) if d.startswith('batch_') and os.path.isdir(os.path.join(data_dir, d))]
+    
+    for batch_dir in sorted(batch_dirs):
+        batch_path = os.path.join(data_dir, batch_dir)
+        metadata_file = os.path.join(batch_path, 'batch_metadata.json')
+        
+        if os.path.exists(metadata_file):
+            with open(metadata_file, 'r') as f:
+                metadata = json.load(f)
+                image_names_in_batch = [os.path.splitext(name)[0] for name in metadata.get('image_names', [])]
+                if image_name in image_names_in_batch:
+                    return batch_path
+        
+        # Fallback: check if the image files exist in this batch
+        ply_file = os.path.join(batch_path, "ply", f"{image_name}.ply")
+        if os.path.exists(ply_file):
+            return batch_path
+    
+    return None
+
+
+def load_vggt_data(data_dir, image_name):
+    """
+    Load VGGT data for a specific image from the batch-organized directory structure.
+    
+    Args:
+        data_dir: Root directory containing the VGGT output (with batch_XXX subdirs)
         image_name: Name of the image (without extension)
     
     Returns:
@@ -338,10 +454,16 @@ def load_vggt_data(data_dir, image_name):
     """
     from utils.colmap_utils import load_individual_camera_parameters
     
-    data = {}
+    # Find which batch contains this image
+    batch_dir = find_image_batch(data_dir, image_name)
+    if batch_dir is None:
+        print(f"Warning: Could not find image {image_name} in any batch")
+        return {}
+    
+    data = {'batch_directory': batch_dir}
     
     # Load raw depth and confidence maps
-    raw_data_dir = os.path.join(data_dir, "raw_data")
+    raw_data_dir = os.path.join(batch_dir, "raw_data")
     if os.path.exists(raw_data_dir):
         depth_file = os.path.join(raw_data_dir, f"{image_name}_depth.npy")
         conf_file = os.path.join(raw_data_dir, f"{image_name}_confidence.npy")
@@ -352,25 +474,78 @@ def load_vggt_data(data_dir, image_name):
             data['confidence_map'] = np.load(conf_file)
     
     # Load camera parameters (try numpy arrays first, then COLMAP format)
-    cameras_dir = os.path.join(data_dir, "cameras")
+    cameras_dir = os.path.join(batch_dir, "individual_cameras")
     if os.path.exists(cameras_dir):
         camera_data = load_individual_camera_parameters(image_name, cameras_dir)
         if camera_data:
             data.update(camera_data)
     
-
-    
     # Load point cloud
-    ply_dir = os.path.join(data_dir, "ply")
+    ply_dir = os.path.join(batch_dir, "ply")
     ply_file = os.path.join(ply_dir, f"{image_name}.ply")
     if os.path.exists(ply_file):
         data['point_cloud'] = trimesh.load(ply_file)
     
     # Load colorized depth map
-    depth_dir = os.path.join(data_dir, "depth")
+    depth_dir = os.path.join(batch_dir, "depth")
     depth_file = os.path.join(depth_dir, f"{image_name}_depth.png")
     if os.path.exists(depth_file):
         data['colorized_depth'] = np.array(Image.open(depth_file))
+    
+    # Load batch metadata
+    metadata_file = os.path.join(batch_dir, 'batch_metadata.json')
+    if os.path.exists(metadata_file):
+        with open(metadata_file, 'r') as f:
+            data['batch_metadata'] = json.load(f)
+    
+    return data
+
+
+def load_batch_data(data_dir, batch_idx):
+    """
+    Load all data for a specific batch.
+    
+    Args:
+        data_dir: Root directory containing the VGGT output
+        batch_idx: Batch index (integer)
+    
+    Returns:
+        dict: Dictionary containing all batch data
+    """
+    import json
+    
+    batch_dir = os.path.join(data_dir, f"batch_{batch_idx:03d}")
+    if not os.path.exists(batch_dir):
+        print(f"Warning: Batch directory {batch_dir} does not exist")
+        return {}
+    
+    data = {'batch_directory': batch_dir, 'batch_index': batch_idx}
+    
+    # Load batch metadata
+    metadata_file = os.path.join(batch_dir, 'batch_metadata.json')
+    if os.path.exists(metadata_file):
+        with open(metadata_file, 'r') as f:
+            data['batch_metadata'] = json.load(f)
+            image_names = [os.path.splitext(name)[0] for name in data['batch_metadata'].get('image_names', [])]
+    else:
+        # Fallback: find image names from ply files
+        ply_dir = os.path.join(batch_dir, "ply")
+        if os.path.exists(ply_dir):
+            ply_files = glob.glob(os.path.join(ply_dir, "*.ply"))
+            image_names = [os.path.splitext(os.path.basename(f))[0] for f in ply_files if not f.endswith('combined.ply')]
+        else:
+            image_names = []
+    
+    # Load combined point cloud
+    combined_ply = os.path.join(batch_dir, "ply", "combined.ply")
+    if os.path.exists(combined_ply):
+        data['combined_point_cloud'] = trimesh.load(combined_ply)
+    
+    # Load individual image data
+    data['images'] = {}
+    for image_name in image_names:
+        image_data = load_vggt_data(data_dir, image_name)
+        data['images'][image_name] = image_data
     
     return data
 
