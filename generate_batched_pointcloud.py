@@ -29,9 +29,9 @@ Output Structure:
     output_dir/
     ├── pointcloud.ply               # Global combined point cloud (all batches)
     ├── batch_000/
-    │   ├── depth/                   # Colorized depth maps (.png)
-    │   ├── raw_data/                # Raw depth & confidence (.npy)
-    │   ├── individual_cameras/      # Camera parameters (.npy)
+    │   ├── depth/                   # Colorized depth maps (.png) [only with --save_raw_data]
+    │   ├── raw_data/                # Raw depth & confidence (.npy) [only with --save_raw_data]
+    │   ├── individual_cameras/      # Camera parameters (.npy) [only with --save_raw_data]
     │   ├── vggt_calibration/        # VGGT calibration (for scale estimation)
     │   ├── transformed/             # Final output in reference coordinate system
     │   │   ├── scale.json           # Scale estimation info
@@ -107,7 +107,7 @@ from collections import defaultdict, Counter
 def parse_args():
     parser = argparse.ArgumentParser(description="VGGT Batch Point Estimation")
     parser.add_argument("-s", "--scene_dir", type=str, required=True, help="Directory containing the scene images")
-    parser.add_argument("-o", "--output_dir", type=str, required=True, help="Directory to save the output point clouds and depth maps (relative to scene_dir if not absolute)")
+    parser.add_argument("-o", "--output_dir", type=str, required=True, help="Directory to save the output point clouds (relative to scene_dir if not absolute)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("-r", "--resolution", type=int, default=518, help="Preprocessing resolution. Model always runs at 518.")
     parser.add_argument("-b", "--batch_size", type=int, default=8, help="Number of images to process together.")
@@ -118,7 +118,7 @@ def parse_args():
     parser.add_argument("--use_neighbor_batching", action="store_true", default=True, help="Use neighbor-based batching based on 3D point sharing (default: True)")
     parser.add_argument("--sequential_batching", action="store_true", default=False, help="Force sequential batching instead of neighbor-based (overrides --use_neighbor_batching)")
 
-    parser.add_argument("--save_raw_data", action="store_true", default=True, help="Save raw depth and confidence maps as numpy arrays for later use")
+    parser.add_argument("--save_raw_data", action="store_true", default=False, help="Save raw depth and confidence maps as numpy arrays for later use")
     
     return parser.parse_args()
 
@@ -455,8 +455,9 @@ def recompute_pointclouds_with_reference_extrinsics(depth_maps, intrinsics, refe
 
 def process_images_for_pointclouds(model, image_paths, dtype, args):
     """
-    Process images in batches to generate and save point clouds and depth maps.
+    Process images in batches to generate and save point clouds.
     Each batch gets its own directory with all related assets.
+    Depth maps and raw data are only saved when --save_raw_data is specified.
     """
     vggt_model_resolution = 518
     
@@ -499,14 +500,14 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         
         # Create batch-specific directory structure
         batch_dir = os.path.join(args.output_dir, f"batch_{batch_idx:03d}")
-        depth_output_dir = os.path.join(batch_dir, "depth")
-        raw_data_dir = os.path.join(batch_dir, "raw_data")
         vggt_calibration_dir = os.path.join(batch_dir, "vggt_calibration")
-        individual_cameras_dir = os.path.join(batch_dir, "individual_cameras")
         transformed_dir = os.path.join(batch_dir, "transformed")
         
-        os.makedirs(depth_output_dir, exist_ok=True)
         if args.save_raw_data:
+            depth_output_dir = os.path.join(batch_dir, "depth")
+            raw_data_dir = os.path.join(batch_dir, "raw_data")
+            individual_cameras_dir = os.path.join(batch_dir, "individual_cameras")
+            os.makedirs(depth_output_dir, exist_ok=True)
             os.makedirs(raw_data_dir, exist_ok=True)
             os.makedirs(individual_cameras_dir, exist_ok=True)
         os.makedirs(vggt_calibration_dir, exist_ok=True)
@@ -651,7 +652,7 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
             print(f"  ⚠️  No points in combined batch, skipping save")
         
         # --- Save Individual Frame Outputs ---
-        # Save one point cloud and one depth map per frame in the batch
+        # Save one point cloud per frame in the batch (and depth map if --save_raw_data is enabled)
         for i in range(len(batch_paths)):
             base_name = os.path.basename(batch_paths[i])
             file_name_no_ext = os.path.splitext(base_name)[0]
@@ -696,13 +697,14 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
             else:
                 print(f"  No points passed confidence threshold for {file_name_no_ext}")
             
-            # --- Save Depth Map ---
-            frame_depth = depth_map_batch[i]
-            colored_depth = colorize_depth_map(frame_depth, cmap=args.colormap)
-            
-            depth_output_filename = os.path.join(depth_output_dir, f"{file_name_no_ext}_depth.png")
-            Image.fromarray(colored_depth).save(depth_output_filename)
-            print(f"  Saved depth map to {depth_output_filename}")
+            # --- Save Depth Map (if raw data saving is enabled) ---
+            if args.save_raw_data:
+                frame_depth = depth_map_batch[i]
+                colored_depth = colorize_depth_map(frame_depth, cmap=args.colormap)
+                
+                depth_output_filename = os.path.join(depth_output_dir, f"{file_name_no_ext}_depth.png")
+                Image.fromarray(colored_depth).save(depth_output_filename)
+                print(f"  Saved depth map to {depth_output_filename}")
 
         # Save batch-specific metadata
         save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_idx, use_neighbor_batching)
@@ -824,7 +826,7 @@ def save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_i
             'actual_batching_used': 'neighbor-based' if use_neighbor_batching else 'sequential'
         },
         'file_structure': {
-            'depth_dir': 'depth/',
+            'depth_dir': 'depth/' if args.save_raw_data else None,
             'raw_data_dir': 'raw_data/' if args.save_raw_data else None,
             'individual_cameras_dir': 'individual_cameras/' if args.save_raw_data else None,
             'vggt_calibration_dir': 'vggt_calibration/',
@@ -881,7 +883,7 @@ def save_processing_metadata(args, image_paths, output_dir):
             'description': 'Each batch has its own directory containing all related assets'
         },
         'file_structure_per_batch': {
-            'depth_dir': 'depth/',
+            'depth_dir': 'depth/' if args.save_raw_data else None,
             'raw_data_dir': 'raw_data/' if args.save_raw_data else None,
             'individual_cameras_dir': 'individual_cameras/' if args.save_raw_data else None,
             'vggt_calibration_dir': 'vggt_calibration/',
