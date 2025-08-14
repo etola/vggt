@@ -47,6 +47,7 @@ Examples:
 import random
 import numpy as np
 import glob
+import json
 import os
 import torch
 import torch.nn.functional as F
@@ -68,6 +69,15 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from utils.colmap_utils import save_vggt_calibration_as_colmap, save_individual_camera_parameters
 
+from utils.reconstruction_transform import (
+    estimate_similarity_transform_from_recons,
+    load_reconstruction,
+    apply_similarity_transform_to_reconstruction,
+    save_reconstruction_text,
+    transform_point_cloud_to_colmap_frame,
+    extract_camera_centers_and_rotations,
+    apply_similarity_transform_to_point,
+)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="VGGT Batch Point Estimation")
@@ -79,6 +89,8 @@ def parse_args():
     parser.add_argument("-m", "--max_images", type=int, default=None, help="Maximum number of images to process")
     parser.add_argument("-c", "--conf_threshold", type=float, default=2.0, help="Confidence threshold to filter points (from depth head, >1).")
     parser.add_argument("--colormap", type=str, default="viridis", help="Colormap for depth visualization (e.g., viridis, jet, inferno).")
+    parser.add_argument("-g", "--reference_calibration", type=str, required=True, help="Directory containing a reference calibration in colmap format")
+
     parser.add_argument("--save_raw_data", action="store_true", default=True, help="Save raw depth and confidence maps as numpy arrays for later use")
     
     return parser.parse_args()
@@ -155,6 +167,48 @@ def run_VGGT_batch_pointcloud(model, images_batch, dtype, vggt_model_resolution=
     
     return points_3d, depth_conf_np, depth_map_np, images_batch.cpu(), extrinsic_np, intrinsic_np
 
+def get_batch_transform(source_sparse_dir, target_sparse_dir, out_dir):
+    result = estimate_similarity_transform_from_recons(
+        source_sparse_dir=source_sparse_dir,
+        target_sparse_dir=target_sparse_dir,
+        robust_scale=True,
+    )
+
+    print("=== Similarity Transform (source -> target) ===")
+    print(f"Common images: {result['num_common']}")
+    if result['num_common'] <= 10:
+        print(f"Names: {result['common_images']}")
+    print(f"Scale: {result['scale']:.9f}")
+    print("Rotation (3x3):")
+    print(np.array2string(result['rotation'], formatter={'float_kind':lambda x: f"{x: .9f}"}))
+    print(f"Translation: {np.array2string(result['translation'], formatter={'float_kind':lambda x: f'{x: .9f}'})}")
+    print(f"RMSE (centers): {result['rmse']:.9f}")
+
+    os.makedirs(out_dir, exist_ok=True)
+    transform_json_out = os.path.join(out_dir, "transform.json")
+    with open(transform_json_out, "w") as f:
+        json.dump({
+            "scale": float(result['scale']),
+            "rotation": result['rotation'].tolist(),
+            "translation": result['translation'].tolist(),
+            "rmse": float(result['rmse']),
+            "num_common": int(result['num_common']),
+            "common_images": result['common_images'],
+        }, f, indent=2)
+    print(f"Wrote transform JSON to {transform_json_out}")
+
+    source_rec = load_reconstruction(source_sparse_dir)
+    transformed = apply_similarity_transform_to_reconstruction(
+        source_rec,
+        scale=float(result['scale']),
+        rotation=result['rotation'],
+        translation=result['translation'],
+        only_image_names=None,
+    )
+    save_reconstruction_text(transformed, out_dir)
+    print(f"Transformed source reconstruction saved to {out_dir}")
+
+    return result
 
 def process_images_for_pointclouds(model, image_paths, dtype, args):
     """
@@ -187,6 +241,7 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         raw_data_dir = os.path.join(batch_dir, "raw_data")
         colmap_dir = os.path.join(batch_dir, "colmap_calibration")
         individual_cameras_dir = os.path.join(batch_dir, "individual_cameras")
+        transformed_dir = os.path.join(batch_dir, "transformed")
         
         os.makedirs(ply_output_dir, exist_ok=True)
         os.makedirs(depth_output_dir, exist_ok=True)
@@ -234,6 +289,11 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         if args.save_raw_data:
             save_individual_camera_parameters(extrinsic_batch, intrinsic_batch, batch_image_names, individual_cameras_dir)
         
+
+        # compute the similarity transform from the batch to the reference calibration
+        transform = get_batch_transform(colmap_dir, args.reference_calibration, transformed_dir)
+
+
         # --- Save Combined Batch Point Cloud ---
         # Flatten all points, confidences, and colors from the batch
         batch_points_flat = points_3d_batch.reshape(-1, 3)
