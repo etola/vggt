@@ -38,10 +38,7 @@ Output Structure:
     │   │   ├── cameras.txt          # Reference COLMAP calibration
     │   │   ├── images.txt
     │   │   ├── points3D.txt
-    │   │   └── ply/                 # Point clouds in reference frame
-    │   │       ├── combined.ply     # Combined point cloud for batch
-    │   │       ├── image1.ply       # Individual image point clouds
-    │   │       └── image2.ply
+    │   │   └── batch.ply            # Combined point cloud [default] OR first image [--save_first_only]
     │   └── batch_metadata.json     # Batch processing info
     ├── batch_001/
     │   └── ...
@@ -65,6 +62,12 @@ Examples:
 
     # Process with custom settings
     python3 generate_batched_pointcloud.py -s scene/ -o output/ -g reference_colmap/ -b 4 -c 2.5 --colormap jet
+
+    # Save only first image point cloud instead of combined (faster, less storage)
+    python3 generate_batched_pointcloud.py -s scene/ -o output/ -g reference_colmap/ --save_first_only
+
+    # Save raw depth data along with point clouds
+    python3 generate_batched_pointcloud.py -s scene/ -o output/ -g reference_colmap/ --save_raw_data
 """
 
 import random
@@ -119,6 +122,7 @@ def parse_args():
     parser.add_argument("--sequential_batching", action="store_true", default=False, help="Force sequential batching instead of neighbor-based (overrides --use_neighbor_batching)")
 
     parser.add_argument("--save_raw_data", action="store_true", default=False, help="Save raw depth and confidence maps as numpy arrays for later use")
+    parser.add_argument("--save_first_only", action="store_true", default=False, help="Save only the first image's point cloud instead of the combined point cloud (faster, less storage).")
     
     return parser.parse_args()
 
@@ -457,6 +461,11 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
     """
     Process images in batches to generate and save point clouds.
     Each batch gets its own directory with all related assets.
+    
+    Point cloud saving behavior:
+    - By default: saves combined point cloud from all images in batch as 'batch.ply'
+    - With --save_first_only: saves point cloud from first image only as 'batch.ply' (faster, less storage)
+    
     Depth maps and raw data are only saved when --save_raw_data is specified.
     """
     vggt_model_resolution = 518
@@ -593,9 +602,8 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         
         print(f"  ✅ Point clouds computed with correct scale and reference poses")
         
-        # Create transformed point clouds directory
-        transformed_ply_dir = os.path.join(transformed_dir, "ply")
-        os.makedirs(transformed_ply_dir, exist_ok=True)
+        # Create transformed directory 
+        os.makedirs(transformed_dir, exist_ok=True)
 
         # Save reference extrinsics to transformed directory as the final output
         print(f"  💾 Saving reference extrinsics to transformed directory...")
@@ -638,22 +646,25 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         combined_filtered_points = batch_points_flat[combined_conf_mask]
         combined_filtered_colors = batch_colors_flat[combined_conf_mask]
         
-        # Save the combined point cloud directly to transformed directory
-        if combined_filtered_points.shape[0] > 0:
-            try:
-                transformed_combined_path = os.path.join(transformed_ply_dir, "combined.ply")
-                combined_pc = trimesh.PointCloud(vertices=combined_filtered_points, colors=combined_filtered_colors)
-                combined_pc.export(transformed_combined_path)
-                print(f"  Saved combined batch with {combined_filtered_points.shape[0]} points to {transformed_combined_path}")
-                
-            except Exception as e:
-                print(f"  ⚠️  Warning: Failed to save combined point cloud: {e}")
-        else:
-            print(f"  ⚠️  No points in combined batch, skipping save")
+        # Save the combined point cloud directly to transformed directory (unless saving first only)
+        if not args.save_first_only:
+            if combined_filtered_points.shape[0] > 0:
+                try:
+                    transformed_combined_path = os.path.join(transformed_dir, "batch.ply")
+                    combined_pc = trimesh.PointCloud(vertices=combined_filtered_points, colors=combined_filtered_colors)
+                    combined_pc.export(transformed_combined_path)
+                    print(f"  Saved combined batch with {combined_filtered_points.shape[0]} points to {transformed_combined_path}")
+                    
+                except Exception as e:
+                    print(f"  ⚠️  Warning: Failed to save combined point cloud: {e}")
+            else:
+                print(f"  ⚠️  No points in combined batch, skipping save")
         
         # --- Save Individual Frame Outputs ---
-        # Save one point cloud per frame in the batch (and depth map if --save_raw_data is enabled)
-        for i in range(len(batch_paths)):
+        # Save point cloud: if save_first_only=True, save only first image's point cloud
+        frame_indices = [0] if args.save_first_only else []  # Only process first image if saving first only
+        
+        for i in frame_indices:
             base_name = os.path.basename(batch_paths[i])
             file_name_no_ext = os.path.splitext(base_name)[0]
 
@@ -687,7 +698,7 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
             # Save individual point cloud directly to transformed directory
             if filtered_points.shape[0] > 0:
                 try:
-                    transformed_output_filename = os.path.join(transformed_ply_dir, f"{file_name_no_ext}.ply")
+                    transformed_output_filename = os.path.join(transformed_dir, "batch.ply")
                     point_cloud = trimesh.PointCloud(vertices=filtered_points, colors=filtered_colors)
                     point_cloud.export(transformed_output_filename)
                     print(f"  Saved {filtered_points.shape[0]} points to {transformed_output_filename}")
@@ -724,7 +735,7 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
 
 def combine_all_transformed_pointclouds(output_dir, num_batches):
     """
-    Combine all transformed/ply/combined.ply files from all batches into a single global point cloud.
+    Combine all transformed/batch.ply files from all batches into a single global point cloud.
     
     Args:
         output_dir: Main output directory containing batch subdirectories
@@ -741,7 +752,7 @@ def combine_all_transformed_pointclouds(output_dir, num_batches):
         # Collect all transformed combined point clouds
         for batch_idx in range(num_batches):
             batch_dir = os.path.join(output_dir, f"batch_{batch_idx:03d}")
-            transformed_combined_path = os.path.join(batch_dir, "transformed", "ply", "combined.ply")
+            transformed_combined_path = os.path.join(batch_dir, "transformed", "batch.ply")
             
             if os.path.exists(transformed_combined_path):
                 try:
@@ -819,6 +830,7 @@ def save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_i
             'conf_threshold': args.conf_threshold,
             'colormap': args.colormap,
             'save_raw_data': args.save_raw_data,
+            'save_first_only': args.save_first_only,
             'vggt_model_resolution': 518,
             'reference_calibration': args.reference_calibration,
             'use_neighbor_batching': args.use_neighbor_batching,
@@ -830,13 +842,12 @@ def save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_i
             'raw_data_dir': 'raw_data/' if args.save_raw_data else None,
             'individual_cameras_dir': 'individual_cameras/' if args.save_raw_data else None,
             'vggt_calibration_dir': 'vggt_calibration/',
-            'transformed_dir': 'transformed/',
-            'final_ply_dir': 'transformed/ply/'
+            'transformed_dir': 'transformed/'
         },
         'file_formats': {
             'global_point_cloud': 'pointcloud.ply (combined from all batches, in reference frame)',
             'point_clouds': '.ply (trimesh format, in reference frame with correct scale)',
-            'combined_point_cloud': 'transformed/ply/combined.ply (combined batch point cloud)',
+            'batch_point_cloud': 'transformed/batch.ply (batch point cloud)',
             'depth_maps': '.png (colorized visualization)',
             'raw_depth': '.npy (numpy array, float32)',
             'confidence': '.npy (numpy array, float32)',
@@ -872,6 +883,7 @@ def save_processing_metadata(args, image_paths, output_dir):
             'conf_threshold': args.conf_threshold,
             'colormap': args.colormap,
             'save_raw_data': args.save_raw_data,
+            'save_first_only': args.save_first_only,
             'vggt_model_resolution': 518,
             'reference_calibration': args.reference_calibration,
             'use_neighbor_batching': args.use_neighbor_batching,
@@ -888,13 +900,12 @@ def save_processing_metadata(args, image_paths, output_dir):
             'individual_cameras_dir': 'individual_cameras/' if args.save_raw_data else None,
             'vggt_calibration_dir': 'vggt_calibration/',
             'transformed_dir': 'transformed/',
-            'final_ply_dir': 'transformed/ply/',
             'batch_metadata': 'batch_metadata.json'
         },
         'file_formats': {
             'global_point_cloud': 'pointcloud.ply (combined from all batches, in reference frame)',
             'point_clouds': '.ply (trimesh format, in reference frame with correct scale)',
-            'combined_point_cloud': 'transformed/ply/combined.ply (combined batch point cloud)',
+            'batch_point_cloud': 'transformed/batch.ply (batch point cloud)',
             'depth_maps': '.png (colorized visualization)',
             'raw_depth': '.npy (numpy array, float32)',
             'confidence': '.npy (numpy array, float32)',
@@ -944,10 +955,6 @@ def find_image_batch(data_dir, image_name):
                 if image_name in image_names_in_batch:
                     return batch_path
         
-        # Fallback: check if the image files exist in this batch (in transformed directory)
-        ply_file = os.path.join(batch_path, "transformed", "ply", f"{image_name}.ply")
-        if os.path.exists(ply_file):
-            return batch_path
     
     return None
 
@@ -991,11 +998,10 @@ def load_vggt_data(data_dir, image_name):
         if camera_data:
             data.update(camera_data)
     
-    # Load point cloud from transformed directory
-    ply_dir = os.path.join(batch_dir, "transformed", "ply")
-    ply_file = os.path.join(ply_dir, f"{image_name}.ply")
-    if os.path.exists(ply_file):
-        data['point_cloud'] = trimesh.load(ply_file)
+    # Load batch point cloud from transformed directory
+    batch_ply_file = os.path.join(batch_dir, "transformed", "batch.ply")
+    if os.path.exists(batch_ply_file):
+        data['batch_point_cloud'] = trimesh.load(batch_ply_file)
     
     # Load colorized depth map
     depth_dir = os.path.join(batch_dir, "depth")
@@ -1039,18 +1045,13 @@ def load_batch_data(data_dir, batch_idx):
             data['batch_metadata'] = json.load(f)
             image_names = [os.path.splitext(name)[0] for name in data['batch_metadata'].get('image_names', [])]
     else:
-        # Fallback: find image names from ply files in transformed directory
-        ply_dir = os.path.join(batch_dir, "transformed", "ply")
-        if os.path.exists(ply_dir):
-            ply_files = glob.glob(os.path.join(ply_dir, "*.ply"))
-            image_names = [os.path.splitext(os.path.basename(f))[0] for f in ply_files if not f.endswith('combined.ply')]
-        else:
-            image_names = []
+        # Fallback: try to get image names from metadata or batch file
+        image_names = []
     
-    # Load combined point cloud from transformed directory
-    combined_ply = os.path.join(batch_dir, "transformed", "ply", "combined.ply")
-    if os.path.exists(combined_ply):
-        data['combined_point_cloud'] = trimesh.load(combined_ply)
+    # Load batch point cloud from transformed directory
+    batch_ply = os.path.join(batch_dir, "transformed", "batch.ply")
+    if os.path.exists(batch_ply):
+        data['batch_point_cloud'] = trimesh.load(batch_ply)
     
     # Load individual image data
     data['images'] = {}
