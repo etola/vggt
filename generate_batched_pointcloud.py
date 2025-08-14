@@ -14,6 +14,8 @@ depth maps, camera calibration, etc.) for easy organization and processing.
 Batching Strategies:
     1. Neighbor-based (default): Groups images that share the most 3D points in the 
        reference calibration, creating batches with better visual overlap
+       - By default, each image is used only once across all batches  
+       - With --allow_image_reuse, images can appear in multiple batches
     2. Sequential: Traditional approach processing images in order
 
 Point Cloud Computation:
@@ -68,6 +70,9 @@ Examples:
 
     # Save raw depth data along with point clouds
     python3 generate_batched_pointcloud.py -s scene/ -o output/ -g reference_colmap/ --save_raw_data
+
+    # Allow images to be reused across multiple batches (neighbor-based batching)
+    python3 generate_batched_pointcloud.py -s scene/ -o output/ -g reference_colmap/ --allow_image_reuse
 """
 
 import random
@@ -120,6 +125,7 @@ def parse_args():
     parser.add_argument("-g", "--reference_calibration", type=str, required=True, help="Directory containing a reference calibration in colmap format")
     parser.add_argument("--use_neighbor_batching", action="store_true", default=True, help="Use neighbor-based batching based on 3D point sharing (default: True)")
     parser.add_argument("--sequential_batching", action="store_true", default=False, help="Force sequential batching instead of neighbor-based (overrides --use_neighbor_batching)")
+    parser.add_argument("--allow_image_reuse", action="store_true", default=False, help="Allow images to be reused across multiple batches in neighbor-based batching")
 
     parser.add_argument("--save_raw_data", action="store_true", default=False, help="Save raw depth and confidence maps as numpy arrays for later use")
     parser.add_argument("--save_first_only", action="store_true", default=False, help="Save only the first image's point cloud instead of the combined point cloud (faster, less storage).")
@@ -314,7 +320,7 @@ def find_best_neighbors(target_image, point_sharing_info, batch_size, excluded_i
     return batch
 
 
-def create_neighbor_based_batches(image_paths, point_sharing_info, batch_size):
+def create_neighbor_based_batches(image_paths, point_sharing_info, batch_size, allow_reuse=False):
     """
     Create batches based on 3D point sharing rather than sequential ordering.
     
@@ -322,6 +328,7 @@ def create_neighbor_based_batches(image_paths, point_sharing_info, batch_size):
         image_paths: List of all image paths to process
         point_sharing_info: Output from analyze_3d_point_sharing()
         batch_size: Size of each batch
+        allow_reuse: Whether to allow images to be reused across batches
     
     Returns:
         list: List of batches, where each batch is a list of image paths
@@ -343,44 +350,51 @@ def create_neighbor_based_batches(image_paths, point_sharing_info, batch_size):
     print(f"  Total images to process: {len(image_paths)}")
     print(f"  Images available in reference: {len(available_images)}")
     print(f"  Batch size: {batch_size}")
+    print(f"  Allow image reuse: {allow_reuse}")
     
     batches = []
     processed_images = set()
     
     # Process images in order, but form batches based on 3D point sharing
     for i, image_name in enumerate(available_images):
-        if image_name in processed_images:
+        if not allow_reuse and image_name in processed_images:
             continue
         
         print(f"\n🗂️  Creating batch {len(batches) + 1} with target {image_name}:")
         
         # Find best neighbors for this image
+        excluded_images = None if allow_reuse else processed_images
         batch_image_names = find_best_neighbors(
             image_name, 
             point_sharing_info, 
             batch_size, 
-            excluded_images=processed_images
+            excluded_images=excluded_images
         )
         
         # Convert image names back to paths
         batch_paths = []
         for name in batch_image_names:
-            if name in name_to_path and name not in processed_images:
+            if name in name_to_path and (allow_reuse or name not in processed_images):
                 batch_paths.append(name_to_path[name])
-                processed_images.add(name)
+                if not allow_reuse:
+                    processed_images.add(name)
         
         if batch_paths:
             batches.append(batch_paths)
             print(f"    ✅ Batch {len(batches)}: {len(batch_paths)} images")
         
-        # Stop if we've processed all images
-        if len(processed_images) >= len(available_images):
+        # Stop if we've processed all images (only when not allowing reuse)
+        if not allow_reuse and len(processed_images) >= len(available_images):
             break
     
     print(f"\n📊 Batching Summary:")
     print(f"  Total batches created: {len(batches)}")
-    print(f"  Images processed: {len(processed_images)}")
-    print(f"  Images skipped: {len(image_paths) - len(processed_images)}")
+    if allow_reuse:
+        print(f"  Images processed: {len(available_images)} (reuse allowed)")
+        print(f"  Total image instances: {sum(len(batch) for batch in batches)}")
+    else:
+        print(f"  Images processed: {len(processed_images)}")
+        print(f"  Images skipped: {len(image_paths) - len(processed_images)}")
     
     return batches
 
@@ -462,6 +476,10 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
     Process images in batches to generate and save point clouds.
     Each batch gets its own directory with all related assets.
     
+    Batching behavior (neighbor-based):
+    - By default: each image used only once across all batches
+    - With --allow_image_reuse: images can appear in multiple batches
+    
     Point cloud saving behavior:
     - By default: saves combined point cloud from all images in batch as 'batch.ply'
     - With --save_first_only: saves point cloud from first image only as 'batch.ply' (faster, less storage)
@@ -487,7 +505,7 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
             use_neighbor_batching = False
         else:
             print(f"✅ Using neighbor-based batching based on 3D point sharing")
-            batches = create_neighbor_based_batches(image_paths, point_sharing_info, args.batch_size)
+            batches = create_neighbor_based_batches(image_paths, point_sharing_info, args.batch_size, args.allow_image_reuse)
     
     if not use_neighbor_batching:
         print(f"📋 Using sequential batching")
@@ -835,6 +853,7 @@ def save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_i
             'reference_calibration': args.reference_calibration,
             'use_neighbor_batching': args.use_neighbor_batching,
             'sequential_batching': args.sequential_batching,
+            'allow_image_reuse': args.allow_image_reuse,
             'actual_batching_used': 'neighbor-based' if use_neighbor_batching else 'sequential'
         },
         'file_structure': {
@@ -887,7 +906,8 @@ def save_processing_metadata(args, image_paths, output_dir):
             'vggt_model_resolution': 518,
             'reference_calibration': args.reference_calibration,
             'use_neighbor_batching': args.use_neighbor_batching,
-            'sequential_batching': args.sequential_batching
+            'sequential_batching': args.sequential_batching,
+            'allow_image_reuse': args.allow_image_reuse
         },
         'batch_organization': {
             'total_batches': num_batches,
