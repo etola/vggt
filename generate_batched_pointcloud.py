@@ -22,6 +22,15 @@ Output Structure:
     │   ├── raw_data/                # Raw depth & confidence (.npy)
     │   ├── individual_cameras/      # Camera parameters (.npy)
     │   ├── colmap_calibration/      # COLMAP format calibration
+    │   ├── transformed/             # Similarity transform results
+    │   │   ├── transform.json       # Transform parameters
+    │   │   ├── cameras.txt          # Transformed COLMAP calibration
+    │   │   ├── images.txt
+    │   │   ├── points3D.txt
+    │   │   └── ply/                 # Transformed point clouds
+    │   │       ├── combined.ply     # Transformed combined point cloud
+    │   │       ├── image1.ply       # Transformed individual point clouds
+    │   │       └── image2.ply
     │   └── batch_metadata.json     # Batch processing info
     ├── batch_001/
     │   └── ...
@@ -292,6 +301,10 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
 
         # compute the similarity transform from the batch to the reference calibration
         transform = get_batch_transform(colmap_dir, args.reference_calibration, transformed_dir)
+        
+        # Create transformed point clouds directory
+        transformed_ply_dir = os.path.join(transformed_dir, "ply")
+        os.makedirs(transformed_ply_dir, exist_ok=True)
 
 
         # --- Save Combined Batch Point Cloud ---
@@ -333,6 +346,24 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         combined_pc.export(combined_ply_path)
         print(f"  Saved combined batch with {combined_filtered_points.shape[0]} points to {combined_ply_path}")
         
+        # Transform and save the combined point cloud using the computed similarity transform
+        if combined_filtered_points.shape[0] > 0:
+            try:
+                transformed_combined_points, transformed_combined_colors = transform_point_cloud_to_colmap_frame(
+                    combined_filtered_points, combined_filtered_colors, transform
+                )
+                
+                # Save transformed combined point cloud
+                transformed_combined_path = os.path.join(transformed_ply_dir, "combined.ply")
+                transformed_combined_pc = trimesh.PointCloud(vertices=transformed_combined_points, colors=transformed_combined_colors)
+                transformed_combined_pc.export(transformed_combined_path)
+                print(f"  Saved transformed combined batch with {transformed_combined_points.shape[0]} points to {transformed_combined_path}")
+                
+            except Exception as e:
+                print(f"  ⚠️  Warning: Failed to transform combined point cloud: {e}")
+        else:
+            print(f"  ⚠️  No points in combined batch, skipping transformation")
+        
         # --- Save Individual Frame Outputs ---
         # Save one point cloud and one depth map per frame in the batch
         for i in range(len(batch_paths)):
@@ -372,7 +403,22 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
             point_cloud.export(output_filename)
             print(f"  Saved {filtered_points.shape[0]} points to {output_filename}")
             
-            if filtered_points.shape[0] == 0:
+            # Transform and save individual point cloud using the computed similarity transform
+            if filtered_points.shape[0] > 0:
+                try:
+                    transformed_points, transformed_colors = transform_point_cloud_to_colmap_frame(
+                        filtered_points, filtered_colors, transform
+                    )
+                    
+                    # Save transformed individual point cloud
+                    transformed_output_filename = os.path.join(transformed_ply_dir, f"{file_name_no_ext}.ply")
+                    transformed_point_cloud = trimesh.PointCloud(vertices=transformed_points, colors=transformed_colors)
+                    transformed_point_cloud.export(transformed_output_filename)
+                    print(f"  Saved transformed {transformed_points.shape[0]} points to {transformed_output_filename}")
+                    
+                except Exception as e:
+                    print(f"  ⚠️  Warning: Failed to transform point cloud for {file_name_no_ext}: {e}")
+            else:
                 print(f"  No points passed confidence threshold for {file_name_no_ext}")
             
             # --- Save Depth Map ---
@@ -422,17 +468,22 @@ def save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_i
             'depth_dir': 'depth/',
             'raw_data_dir': 'raw_data/' if args.save_raw_data else None,
             'individual_cameras_dir': 'individual_cameras/' if args.save_raw_data else None,
-            'colmap_calibration_dir': 'colmap_calibration/'
+            'colmap_calibration_dir': 'colmap_calibration/',
+            'transformed_dir': 'transformed/',
+            'transformed_ply_dir': 'transformed/ply/'
         },
         'file_formats': {
             'point_clouds': '.ply (trimesh format)',
             'combined_point_cloud': 'combined.ply (all batch images combined)',
+            'transformed_point_clouds': '.ply (trimesh format, transformed to reference frame)',
+            'transformed_combined': 'transformed/ply/combined.ply (transformed combined point cloud)',
             'depth_maps': '.png (colorized visualization)',
             'raw_depth': '.npy (numpy array, float32)',
             'confidence': '.npy (numpy array, float32)',
             'extrinsics': '.npy (numpy array, shape [3, 4])',
             'intrinsics': '.npy (numpy array, shape [3, 3])',
-            'colmap_calibration': 'COLMAP sparse reconstruction format (cameras.txt, images.txt, points3D.txt)'
+            'colmap_calibration': 'COLMAP sparse reconstruction format (cameras.txt, images.txt, points3D.txt)',
+            'transform_data': 'transform.json (similarity transform parameters)'
         }
     }
     
@@ -474,6 +525,8 @@ def save_processing_metadata(args, image_paths, output_dir):
             'raw_data_dir': 'raw_data/' if args.save_raw_data else None,
             'individual_cameras_dir': 'individual_cameras/' if args.save_raw_data else None,
             'colmap_calibration_dir': 'colmap_calibration/',
+            'transformed_dir': 'transformed/',
+            'transformed_ply_dir': 'transformed/ply/',
             'batch_metadata': 'batch_metadata.json'
         },
         'file_formats': {
