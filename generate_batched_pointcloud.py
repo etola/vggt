@@ -11,8 +11,14 @@ Generate point clouds from image sequences using VGGT model with batched process
 Each batch creates its own directory containing all related assets (point clouds, 
 depth maps, camera calibration, etc.) for easy organization and processing.
 
+Batching Strategies:
+    1. Neighbor-based (default): Groups images that share the most 3D points in the 
+       reference calibration, creating batches with better visual overlap
+    2. Sequential: Traditional approach processing images in order
+
 Output Structure:
     output_dir/
+    ├── pointcloud.ply               # Global combined point cloud (all batches)
     ├── batch_000/
     │   ├── ply/                     # Point clouds (.ply files)
     │   │   ├── combined.ply         # All batch images combined
@@ -37,20 +43,23 @@ Output Structure:
     └── processing_metadata.json    # Overall processing info
 
 Examples:
-    # Basic usage with short flags (output relative to scene directory)
-    python3 generate_batched_pointcloud.py -s scene/ -o output/
+    # Basic usage with neighbor-based batching (default)
+    python3 generate_batched_pointcloud.py -s scene/ -o output/ -g reference_colmap/
 
-    # Specify batch size and resolution
-    python3 generate_batched_pointcloud.py -s scene/ -o results/ -b 16 -r 512
+    # Specify batch size and resolution with neighbor-based batching
+    python3 generate_batched_pointcloud.py -s scene/ -o results/ -g reference_colmap/ -b 16 -r 512
 
-    # Use absolute output path
-    python3 generate_batched_pointcloud.py -s scene/ -o /tmp/pointclouds/
+    # Force sequential batching instead of neighbor-based
+    python3 generate_batched_pointcloud.py -s scene/ -o output/ -g reference_colmap/ --sequential_batching
+
+    # Use absolute output path with neighbor-based batching
+    python3 generate_batched_pointcloud.py -s scene/ -o /tmp/pointclouds/ -g reference_colmap/
 
     # Limit number of images and set confidence threshold
-    python3 generate_batched_pointcloud.py -s scene/ -o output/ -m 50 -c 1.5
+    python3 generate_batched_pointcloud.py -s scene/ -o output/ -g reference_colmap/ -m 50 -c 1.5
 
     # Process with custom settings
-    python3 generate_batched_pointcloud.py -s scene/ -o output/ -b 4 -c 2.5 --colormap jet
+    python3 generate_batched_pointcloud.py -s scene/ -o output/ -g reference_colmap/ -b 4 -c 2.5 --colormap jet
 """
 
 import random
@@ -87,6 +96,7 @@ from utils.reconstruction_transform import (
     extract_camera_centers_and_rotations,
     apply_similarity_transform_to_point,
 )
+from collections import defaultdict, Counter
 
 def parse_args():
     parser = argparse.ArgumentParser(description="VGGT Batch Point Estimation")
@@ -99,6 +109,8 @@ def parse_args():
     parser.add_argument("-c", "--conf_threshold", type=float, default=2.0, help="Confidence threshold to filter points (from depth head, >1).")
     parser.add_argument("--colormap", type=str, default="viridis", help="Colormap for depth visualization (e.g., viridis, jet, inferno).")
     parser.add_argument("-g", "--reference_calibration", type=str, required=True, help="Directory containing a reference calibration in colmap format")
+    parser.add_argument("--use_neighbor_batching", action="store_true", default=True, help="Use neighbor-based batching based on 3D point sharing (default: True)")
+    parser.add_argument("--sequential_batching", action="store_true", default=False, help="Force sequential batching instead of neighbor-based (overrides --use_neighbor_batching)")
 
     parser.add_argument("--save_raw_data", action="store_true", default=True, help="Save raw depth and confidence maps as numpy arrays for later use")
     
@@ -219,6 +231,190 @@ def get_batch_transform(source_sparse_dir, target_sparse_dir, out_dir):
 
     return result
 
+
+def analyze_3d_point_sharing(reference_calibration_dir):
+    """
+    Analyze 3D point sharing between images in the reference calibration.
+    
+    Args:
+        reference_calibration_dir: Path to reference COLMAP reconstruction
+    
+    Returns:
+        dict: {
+            'image_to_points': dict mapping image names to sets of 3D point IDs,
+            'point_to_images': dict mapping 3D point IDs to sets of image names,
+            'image_names': list of all image names in reconstruction
+        }
+    """
+    try:
+        # Load reference reconstruction
+        reconstruction = load_reconstruction(reference_calibration_dir)
+        
+        # Initialize data structures
+        image_to_points = defaultdict(set)
+        point_to_images = defaultdict(set)
+        image_names = []
+        
+        # Get all registered image names
+        for image_id, image in reconstruction.images.items():
+            if image.registered:
+                image_names.append(image.name)
+        
+        # Analyze 3D point tracks
+        for point3d_id, point3d in reconstruction.points3D.items():
+            track = point3d.track
+            
+            # Each track element contains image_id and point2D_idx
+            for track_element in track.elements:
+                image_id = track_element.image_id
+                
+                # Get image name from image_id
+                if image_id in reconstruction.images:
+                    image = reconstruction.images[image_id]
+                    if image.registered:
+                        image_name = image.name
+                        
+                        # Record the association
+                        image_to_points[image_name].add(point3d_id)
+                        point_to_images[point3d_id].add(image_name)
+        
+        print(f"📊 3D Point Analysis:")
+        print(f"  Total registered images: {len(image_names)}")
+        print(f"  Total 3D points: {len(reconstruction.points3D)}")
+        
+        # Convert defaultdict to regular dict for cleaner output
+        return {
+            'image_to_points': dict(image_to_points),
+            'point_to_images': dict(point_to_images),
+            'image_names': sorted(image_names)
+        }
+        
+    except Exception as e:
+        print(f"❌ Error analyzing 3D point sharing: {e}")
+        return None
+
+
+def find_best_neighbors(target_image, point_sharing_info, batch_size, excluded_images=None):
+    """
+    Find the best neighboring images that share the most 3D points with the target image.
+    
+    Args:
+        target_image: Name of the target image
+        point_sharing_info: Output from analyze_3d_point_sharing()
+        batch_size: Number of images to include in batch (including target)
+        excluded_images: Set of image names to exclude (already processed)
+    
+    Returns:
+        list: List of image names for the batch (including target image)
+    """
+    if excluded_images is None:
+        excluded_images = set()
+    
+    image_to_points = point_sharing_info['image_to_points']
+    
+    if target_image not in image_to_points:
+        print(f"⚠️  Warning: Target image {target_image} not found in reference calibration")
+        return [target_image]
+    
+    target_points = image_to_points[target_image]
+    
+    # Calculate shared points with all other images
+    shared_counts = Counter()
+    
+    for other_image, other_points in image_to_points.items():
+        if other_image != target_image and other_image not in excluded_images:
+            shared_points = len(target_points.intersection(other_points))
+            if shared_points > 0:
+                shared_counts[other_image] = shared_points
+    
+    # Get the top (batch_size - 1) neighbors
+    best_neighbors = [img for img, count in shared_counts.most_common(batch_size - 1)]
+    
+    # Create the batch with target image first
+    batch = [target_image] + best_neighbors
+    
+    # Report sharing statistics
+    print(f"  🎯 Target: {target_image} (has {len(target_points)} 3D points)")
+    for neighbor in best_neighbors:
+        if neighbor in image_to_points:
+            neighbor_points = image_to_points[neighbor]
+            shared = len(target_points.intersection(neighbor_points))
+            print(f"    📌 {neighbor}: {shared} shared points (has {len(neighbor_points)} total)")
+    
+    return batch
+
+
+def create_neighbor_based_batches(image_paths, point_sharing_info, batch_size):
+    """
+    Create batches based on 3D point sharing rather than sequential ordering.
+    
+    Args:
+        image_paths: List of all image paths to process
+        point_sharing_info: Output from analyze_3d_point_sharing()
+        batch_size: Size of each batch
+    
+    Returns:
+        list: List of batches, where each batch is a list of image paths
+    """
+    # Extract image names from paths for matching with reference calibration
+    path_to_name = {path: os.path.basename(path) for path in image_paths}
+    name_to_path = {os.path.basename(path): path for path in image_paths}
+    
+    # Get available images that are in both our dataset and reference calibration
+    available_images = []
+    for path in image_paths:
+        image_name = os.path.basename(path)
+        if image_name in point_sharing_info['image_to_points']:
+            available_images.append(image_name)
+        else:
+            print(f"⚠️  Warning: {image_name} not found in reference calibration, skipping")
+    
+    print(f"📋 Neighbor-based batching:")
+    print(f"  Total images to process: {len(image_paths)}")
+    print(f"  Images available in reference: {len(available_images)}")
+    print(f"  Batch size: {batch_size}")
+    
+    batches = []
+    processed_images = set()
+    
+    # Process images in order, but form batches based on 3D point sharing
+    for i, image_name in enumerate(available_images):
+        if image_name in processed_images:
+            continue
+        
+        print(f"\n🗂️  Creating batch {len(batches) + 1} with target {image_name}:")
+        
+        # Find best neighbors for this image
+        batch_image_names = find_best_neighbors(
+            image_name, 
+            point_sharing_info, 
+            batch_size, 
+            excluded_images=processed_images
+        )
+        
+        # Convert image names back to paths
+        batch_paths = []
+        for name in batch_image_names:
+            if name in name_to_path and name not in processed_images:
+                batch_paths.append(name_to_path[name])
+                processed_images.add(name)
+        
+        if batch_paths:
+            batches.append(batch_paths)
+            print(f"    ✅ Batch {len(batches)}: {len(batch_paths)} images")
+        
+        # Stop if we've processed all images
+        if len(processed_images) >= len(available_images):
+            break
+    
+    print(f"\n📊 Batching Summary:")
+    print(f"  Total batches created: {len(batches)}")
+    print(f"  Images processed: {len(processed_images)}")
+    print(f"  Images skipped: {len(image_paths) - len(processed_images)}")
+    
+    return batches
+
+
 def process_images_for_pointclouds(model, image_paths, dtype, args):
     """
     Process images in batches to generate and save point clouds and depth maps.
@@ -230,18 +426,38 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
     if args.max_images is not None:
         image_paths = image_paths[:args.max_images]
     
-    # Split into batches
-    num_batches = (len(image_paths) + args.batch_size - 1) // args.batch_size
+    # Determine batching strategy
+    use_neighbor_batching = args.use_neighbor_batching and not args.sequential_batching
     
-    print(f"Processing {len(image_paths)} images in {num_batches} batches of size {args.batch_size}")
+    if use_neighbor_batching:
+        print(f"🔍 Analyzing 3D point sharing in reference calibration...")
+        # Analyze 3D point sharing from reference calibration
+        point_sharing_info = analyze_3d_point_sharing(args.reference_calibration)
+        
+        if point_sharing_info is None:
+            print("❌ Failed to analyze 3D point sharing, falling back to sequential batching")
+            use_neighbor_batching = False
+        else:
+            print(f"✅ Using neighbor-based batching based on 3D point sharing")
+            batches = create_neighbor_based_batches(image_paths, point_sharing_info, args.batch_size)
+    
+    if not use_neighbor_batching:
+        print(f"📋 Using sequential batching")
+        # Sequential batching
+        num_batches = (len(image_paths) + args.batch_size - 1) // args.batch_size
+        batches = []
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * args.batch_size
+            end_idx = min(start_idx + args.batch_size, len(image_paths))
+            batches.append(image_paths[start_idx:end_idx])
+    
+    num_batches = len(batches)
+    print(f"\n🚀 Processing {len(image_paths)} images in {num_batches} batches")
     print(f"Preprocessing at {args.resolution}x{args.resolution}, model runs at {vggt_model_resolution}x{vggt_model_resolution}")
     
-    for batch_idx in range(num_batches):
-        start_idx = batch_idx * args.batch_size
-        end_idx = min(start_idx + args.batch_size, len(image_paths))
-        batch_paths = image_paths[start_idx:end_idx]
-        
-        print(f"Processing batch {batch_idx + 1}/{num_batches}: images {start_idx + 1}-{end_idx}")
+    for batch_idx, batch_paths in enumerate(batches):
+        print(f"\nProcessing batch {batch_idx + 1}/{num_batches}: {len(batch_paths)} images")
+        print(f"  Images: {[os.path.basename(p) for p in batch_paths]}")
         
         # Create batch-specific directory structure
         batch_dir = os.path.join(args.output_dir, f"batch_{batch_idx:03d}")
@@ -430,18 +646,99 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
             print(f"  Saved depth map to {depth_output_filename}")
 
         # Save batch-specific metadata
-        save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_idx)
+        save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_idx, use_neighbor_batching)
 
         # Aggressive memory cleanup
         del images, images_for_model, points_3d_batch, depth_conf_batch, depth_map_batch, images_for_color
         torch.cuda.empty_cache()
         gc.collect()
     
+    # Combine all transformed point clouds into a single global point cloud
+    print(f"\n🔗 Combining all transformed point clouds...")
+    combine_all_transformed_pointclouds(args.output_dir, num_batches)
+    
     # Save overall processing metadata
     save_processing_metadata(args, image_paths, args.output_dir)
 
 
-def save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_idx):
+def combine_all_transformed_pointclouds(output_dir, num_batches):
+    """
+    Combine all transformed/ply/combined.ply files from all batches into a single global point cloud.
+    
+    Args:
+        output_dir: Main output directory containing batch subdirectories
+        num_batches: Number of batches processed
+    """
+    try:
+        all_vertices = []
+        all_colors = []
+        successful_batches = 0
+        total_points = 0
+        
+        print(f"  🔍 Searching for transformed point clouds in {num_batches} batches...")
+        
+        # Collect all transformed combined point clouds
+        for batch_idx in range(num_batches):
+            batch_dir = os.path.join(output_dir, f"batch_{batch_idx:03d}")
+            transformed_combined_path = os.path.join(batch_dir, "transformed", "ply", "combined.ply")
+            
+            if os.path.exists(transformed_combined_path):
+                try:
+                    # Load the point cloud
+                    point_cloud = trimesh.load(transformed_combined_path)
+                    
+                    if hasattr(point_cloud, 'vertices') and len(point_cloud.vertices) > 0:
+                        vertices = point_cloud.vertices
+                        colors = point_cloud.colors if hasattr(point_cloud, 'colors') else None
+                        
+                        all_vertices.append(vertices)
+                        if colors is not None:
+                            all_colors.append(colors)
+                        else:
+                            # Create default gray colors if colors are missing
+                            gray_colors = np.full((len(vertices), 3), 128, dtype=np.uint8)
+                            all_colors.append(gray_colors)
+                        
+                        successful_batches += 1
+                        total_points += len(vertices)
+                        print(f"    ✅ batch_{batch_idx:03d}: {len(vertices)} points")
+                    else:
+                        print(f"    ⚠️  batch_{batch_idx:03d}: No vertices found")
+                        
+                except Exception as e:
+                    print(f"    ❌ batch_{batch_idx:03d}: Failed to load - {e}")
+            else:
+                print(f"    ⚠️  batch_{batch_idx:03d}: Transformed point cloud not found")
+        
+        if successful_batches == 0:
+            print(f"  ❌ No transformed point clouds found to combine")
+            return False
+        
+        # Combine all vertices and colors
+        print(f"  🔗 Combining {successful_batches} point clouds...")
+        combined_vertices = np.vstack(all_vertices)
+        combined_colors = np.vstack(all_colors)
+        
+        # Create and save the combined point cloud
+        global_pointcloud_path = os.path.join(output_dir, "pointcloud.ply")
+        combined_pointcloud = trimesh.PointCloud(vertices=combined_vertices, colors=combined_colors)
+        combined_pointcloud.export(global_pointcloud_path)
+        
+        print(f"  ✅ Successfully combined {successful_batches}/{num_batches} batches")
+        print(f"     Total points: {len(combined_vertices):,}")
+        print(f"     Saved to: {global_pointcloud_path}")
+        print(f"     Point range: X[{combined_vertices[:,0].min():.3f}, {combined_vertices[:,0].max():.3f}], "
+              f"Y[{combined_vertices[:,1].min():.3f}, {combined_vertices[:,1].max():.3f}], "
+              f"Z[{combined_vertices[:,2].min():.3f}, {combined_vertices[:,2].max():.3f}]")
+        
+        return True
+        
+    except Exception as e:
+        print(f"  ❌ Error combining point clouds: {e}")
+        return False
+
+
+def save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_idx, use_neighbor_batching):
     """Save metadata for a single batch."""
     import json
     
@@ -461,7 +758,11 @@ def save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_i
             'conf_threshold': args.conf_threshold,
             'colormap': args.colormap,
             'save_raw_data': args.save_raw_data,
-            'vggt_model_resolution': 518
+            'vggt_model_resolution': 518,
+            'reference_calibration': args.reference_calibration,
+            'use_neighbor_batching': args.use_neighbor_batching,
+            'sequential_batching': args.sequential_batching,
+            'actual_batching_used': 'neighbor-based' if use_neighbor_batching else 'sequential'
         },
         'file_structure': {
             'ply_dir': 'ply/',
@@ -473,6 +774,7 @@ def save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_i
             'transformed_ply_dir': 'transformed/ply/'
         },
         'file_formats': {
+            'global_point_cloud': 'pointcloud.ply (combined from all batches, transformed to reference frame)',
             'point_clouds': '.ply (trimesh format)',
             'combined_point_cloud': 'combined.ply (all batch images combined)',
             'transformed_point_clouds': '.ply (trimesh format, transformed to reference frame)',
@@ -512,7 +814,10 @@ def save_processing_metadata(args, image_paths, output_dir):
             'conf_threshold': args.conf_threshold,
             'colormap': args.colormap,
             'save_raw_data': args.save_raw_data,
-            'vggt_model_resolution': 518
+            'vggt_model_resolution': 518,
+            'reference_calibration': args.reference_calibration,
+            'use_neighbor_batching': args.use_neighbor_batching,
+            'sequential_batching': args.sequential_batching
         },
         'batch_organization': {
             'total_batches': num_batches,
@@ -530,14 +835,18 @@ def save_processing_metadata(args, image_paths, output_dir):
             'batch_metadata': 'batch_metadata.json'
         },
         'file_formats': {
+            'global_point_cloud': 'pointcloud.ply (combined from all batches, transformed to reference frame)',
             'point_clouds': '.ply (trimesh format)',
             'combined_point_cloud': 'combined.ply (all batch images combined)',
+            'transformed_point_clouds': '.ply (trimesh format, transformed to reference frame)',
+            'transformed_combined': 'transformed/ply/combined.ply (transformed combined point cloud)',
             'depth_maps': '.png (colorized visualization)',
             'raw_depth': '.npy (numpy array, float32)',
             'confidence': '.npy (numpy array, float32)',
             'extrinsics': '.npy (numpy array, shape [3, 4])',
             'intrinsics': '.npy (numpy array, shape [3, 3])',
-            'colmap_calibration': 'COLMAP sparse reconstruction format (cameras.txt, images.txt, points3D.txt)'
+            'colmap_calibration': 'COLMAP sparse reconstruction format (cameras.txt, images.txt, points3D.txt)',
+            'transform_data': 'transform.json (similarity transform parameters)'
         },
         'data_info': {
             'total_images_processed': len(image_paths),
@@ -764,8 +1073,9 @@ def main():
     # Process images in batches to generate point clouds
     process_images_for_pointclouds(model, image_path_list, dtype, args)
     
-    print(f"Point cloud estimation completed successfully!")
-    print(f"Results saved to: {args.output_dir}")
+    print(f"🎉 Point cloud estimation completed successfully!")
+    print(f"📁 Results saved to: {args.output_dir}")
+    print(f"🌐 Global point cloud: {os.path.join(args.output_dir, 'pointcloud.ply')}")
 
     return True
 
