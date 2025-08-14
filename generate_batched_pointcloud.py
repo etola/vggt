@@ -19,9 +19,9 @@ Batching Strategies:
 Point Cloud Computation:
     - Uses VGGT intrinsics with reference calibration extrinsics for unprojection
     - Saves VGGT extrinsics to vggt_calibration/ for scale estimation against reference
+    - Estimates scale factor between VGGT and reference coordinate systems
     - Scales VGGT depth maps with estimated scale before unprojection 
-    - Recomputes point clouds with scaled depth maps and reference extrinsics
-    - Sets transform scale to 1.0 (no additional scaling needed)
+    - Computes point clouds with scaled depth maps and reference extrinsics
     - Saves reference extrinsics to transformed/ as final output
     - Results are directly in reference coordinate system with correct scale
 
@@ -37,8 +37,8 @@ Output Structure:
     │   ├── raw_data/                # Raw depth & confidence (.npy)
     │   ├── individual_cameras/      # Camera parameters (.npy)
     │   ├── vggt_calibration/      # VGGT calibration (for scale estimation)
-    │   ├── transformed/             # Reference calibration & transform results
-    │   │   ├── transform.json       # Transform parameters
+    │   ├── transformed/             # Reference calibration & scale results
+    │   │   ├── scale.json           # Scale estimation info
     │   │   ├── cameras.txt          # Reference COLMAP calibration (final output)
     │   │   ├── images.txt
     │   │   ├── points3D.txt
@@ -198,48 +198,44 @@ def run_VGGT_batch_pointcloud(model, images_batch, dtype, vggt_model_resolution=
     
     return points_3d, depth_conf_np, depth_map_np, images_batch.cpu(), extrinsic_np, intrinsic_np
 
-def get_batch_transform(source_sparse_dir, target_sparse_dir, out_dir):
+def estimate_scale_only(source_sparse_dir, target_sparse_dir, out_dir):
+    """
+    Estimate only the scale component from source to target reconstruction.
+    
+    Args:
+        source_sparse_dir: Path to source COLMAP reconstruction  
+        target_sparse_dir: Path to target COLMAP reconstruction
+        out_dir: Output directory for scale info
+    
+    Returns:
+        float: Estimated scale factor
+    """
     result = estimate_similarity_transform_from_recons(
         source_sparse_dir=source_sparse_dir,
         target_sparse_dir=target_sparse_dir,
         robust_scale=True,
     )
 
-    print("=== Similarity Transform (source -> target) ===")
+    print("=== Scale Estimation (source -> target) ===")
     print(f"Common images: {result['num_common']}")
     if result['num_common'] <= 10:
         print(f"Names: {result['common_images']}")
     print(f"Scale: {result['scale']:.9f}")
-    print("Rotation (3x3):")
-    print(np.array2string(result['rotation'], formatter={'float_kind':lambda x: f"{x: .9f}"}))
-    print(f"Translation: {np.array2string(result['translation'], formatter={'float_kind':lambda x: f'{x: .9f}'})}")
     print(f"RMSE (centers): {result['rmse']:.9f}")
 
+    # Save only scale information
     os.makedirs(out_dir, exist_ok=True)
-    transform_json_out = os.path.join(out_dir, "transform.json")
-    with open(transform_json_out, "w") as f:
+    scale_json_out = os.path.join(out_dir, "scale.json")
+    with open(scale_json_out, "w") as f:
         json.dump({
             "scale": float(result['scale']),
-            "rotation": result['rotation'].tolist(),
-            "translation": result['translation'].tolist(),
             "rmse": float(result['rmse']),
             "num_common": int(result['num_common']),
             "common_images": result['common_images'],
         }, f, indent=2)
-    print(f"Wrote transform JSON to {transform_json_out}")
+    print(f"Wrote scale info to {scale_json_out}")
 
-    source_rec = load_reconstruction(source_sparse_dir)
-    transformed = apply_similarity_transform_to_reconstruction(
-        source_rec,
-        scale=float(result['scale']),
-        rotation=result['rotation'],
-        translation=result['translation'],
-        only_image_names=None,
-    )
-    save_reconstruction_text(transformed, out_dir)
-    print(f"Transformed source reconstruction saved to {out_dir}")
-
-    return result
+    return result['scale']
 
 
 def analyze_3d_point_sharing(reference_calibration_dir):
@@ -601,9 +597,8 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
             save_individual_camera_parameters(vggt_extrinsic_batch, intrinsic_batch, batch_image_names, individual_cameras_dir)
         
 
-        # compute the similarity transform from the batch to the reference calibration
-        full_transform = get_batch_transform(vggt_calibration_dir, args.reference_calibration, transformed_dir)
-        estimated_scale = full_transform['scale']
+        # Estimate scale from the batch to the reference calibration
+        estimated_scale = estimate_scale_only(vggt_calibration_dir, args.reference_calibration, transformed_dir)
         
         print(f"  📐 Estimated scale: {estimated_scale:.6f}")
         print(f"  🔄 Scaling depth maps before point cloud computation...")
@@ -617,17 +612,7 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
             scaled_depth_maps, intrinsic_batch, reference_extrinsics
         )
         
-        # Set transform scale to 1 since depth maps are already scaled
-        transform = {
-            'scale': 1.0,  # No additional scaling needed
-            'rotation': np.eye(3),  # Identity matrix
-            'translation': np.zeros(3),  # Zero translation
-            'rmse': full_transform['rmse'],
-            'num_common': full_transform['num_common'],
-            'common_images': full_transform['common_images']
-        }
-        
-        print(f"  ✅ Transform scale set to 1.0 (depth maps already scaled)")
+        print(f"  ✅ Point clouds computed with correct scale and reference poses")
         
         # Create transformed point clouds directory
         transformed_ply_dir = os.path.join(transformed_dir, "ply")
@@ -895,7 +880,7 @@ def save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_i
             'extrinsics': '.npy (numpy array, shape [3, 4])',
             'intrinsics': '.npy (numpy array, shape [3, 3])',
             'vggt_calibration': 'VGGT sparse reconstruction format (cameras.txt, images.txt, points3D.txt)',
-            'transform_data': 'transform.json (similarity transform parameters)'
+            'scale_data': 'scale.json (scale estimation info)'
         }
     }
     
@@ -956,7 +941,7 @@ def save_processing_metadata(args, image_paths, output_dir):
             'extrinsics': '.npy (numpy array, shape [3, 4])',
             'intrinsics': '.npy (numpy array, shape [3, 3])',
             'vggt_calibration': 'VGGT sparse reconstruction format (cameras.txt, images.txt, points3D.txt)',
-            'transform_data': 'transform.json (similarity transform parameters)'
+            'scale_data': 'scale.json (scale estimation info)'
         },
         'data_info': {
             'total_images_processed': len(image_paths),
