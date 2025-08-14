@@ -379,6 +379,55 @@ def compute_similarity_transform(source_sparse_dir: str, target_sparse_dir: str,
     )
 
 
+def estimate_scale_only_from_recons(
+    source_sparse_dir: str,
+    target_sparse_dir: str,
+    robust_scale: bool = True,
+) -> Dict:
+    """Estimate only the scale factor aligning source to target using matched image names and camera centers.
+    
+    This is a simplified version of estimate_similarity_transform_from_recons that only computes
+    the scale component, which is more efficient when only scale is needed (e.g., for depth map scaling).
+
+    Steps:
+      1) Load reconstructions; extract camera centers; match on image names
+      2) Estimate scale s from centers using robust or least-squares method
+      
+    Args:
+        source_sparse_dir: Path to source COLMAP reconstruction directory
+        target_sparse_dir: Path to target COLMAP reconstruction directory  
+        robust_scale: Whether to use robust scale estimation (median of pairwise ratios)
+        
+    Returns:
+        Dict with keys: 'scale', 'rmse_estimate', 'num_common', 'common_images'
+    """
+    source_rec = load_reconstruction(source_sparse_dir)
+    target_rec = load_reconstruction(target_sparse_dir)
+
+    src_poses = extract_camera_centers_and_rotations(source_rec)
+    dst_poses = extract_camera_centers_and_rotations(target_rec)
+
+    common = match_common_image_names(src_poses, dst_poses)
+
+    src_centers = np.asarray([src_poses[name]["center"] for name in common], dtype=float)
+    dst_centers = np.asarray([dst_poses[name]["center"] for name in common], dtype=float)
+
+    scale = estimate_scale_from_centers(src_centers, dst_centers, robust=robust_scale)
+    
+    # Compute a simple scale-only RMSE for validation
+    # This applies only scale transformation: scaled_src = scale * src_centers
+    # Then computes RMS distance to dst_centers (won't be perfect since no rotation/translation)
+    scaled_src = scale * src_centers
+    scale_only_rmse = float(np.sqrt(np.mean(np.sum((scaled_src - dst_centers) ** 2, axis=1))))
+
+    return {
+        "scale": scale,
+        "rmse_estimate": scale_only_rmse,
+        "num_common": len(common),
+        "common_images": common,
+    }
+
+
 def extract_camera_poses(reconstruction: pycolmap.Reconstruction) -> Dict[str, Dict[str, np.ndarray]]:
     """Extract camera poses (positions and orientations) from reconstruction.
     
