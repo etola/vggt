@@ -314,6 +314,23 @@ def find_best_neighbors(target_image, point_sharing_info, batch_size, excluded_i
     return batch
 
 
+def create_neighbor_based_batches_cached(image_paths, cached_calibration_data, batch_size, allow_reuse=False):
+    """
+    Create neighbor-based batches using cached calibration data.
+    
+    Args:
+        image_paths: List of image file paths
+        cached_calibration_data: Pre-loaded calibration data
+        batch_size: Number of images per batch
+        allow_reuse: Whether to allow images to be reused across batches
+    
+    Returns:
+        List of batch paths
+    """
+    point_sharing_info = cached_calibration_data['point_sharing_info']
+    return create_neighbor_based_batches(image_paths, point_sharing_info, batch_size, allow_reuse)
+
+
 def create_neighbor_based_batches(image_paths, point_sharing_info, batch_size, allow_reuse=False):
     """
     Create batches based on 3D point sharing rather than sequential ordering.
@@ -393,6 +410,54 @@ def create_neighbor_based_batches(image_paths, point_sharing_info, batch_size, a
     return batches
 
 
+def load_and_cache_calibration_data(reference_calibration_dir):
+    """
+    Load and cache all necessary calibration data structures to avoid repeated loading.
+    
+    Args:
+        reference_calibration_dir: Path to reference COLMAP reconstruction
+    
+    Returns:
+        dict: Cached calibration data containing:
+            - 'reconstruction': pycolmap.Reconstruction object
+            - 'colmap_data': COLMAP calibration data from load_colmap_calibration
+            - 'camera_poses': Camera centers and rotations for scale estimation
+            - 'point_sharing_info': 3D point sharing analysis for neighbor batching
+    """
+    print(f"📚 Loading and caching calibration data from {reference_calibration_dir}...")
+    
+    try:
+        # Load COLMAP reconstruction (used by analyze_3d_point_sharing and scale estimation)
+        from utils.reconstruction_transform import load_reconstruction, extract_camera_centers_and_rotations
+        reconstruction = load_reconstruction(reference_calibration_dir)
+        
+        # Load COLMAP calibration data (used by load_reference_extrinsics_for_batch)
+        from utils.colmap_utils import load_colmap_calibration
+        colmap_data = load_colmap_calibration(reference_calibration_dir)
+        
+        # Extract camera poses (used by scale estimation)
+        camera_poses = extract_camera_centers_and_rotations(reconstruction)
+        
+        # Analyze 3D point sharing (used by neighbor-based batching)
+        point_sharing_info = analyze_3d_point_sharing_from_reconstruction(reconstruction)
+        
+        cached_data = {
+            'reconstruction': reconstruction,
+            'colmap_data': colmap_data,
+            'camera_poses': camera_poses,
+            'point_sharing_info': point_sharing_info,
+        }
+        
+        print(f"  ✅ Cached {len(camera_poses)} camera poses")
+        print(f"  ✅ Cached point sharing info for {len(point_sharing_info['image_names'])} images")
+        
+        return cached_data
+        
+    except Exception as e:
+        print(f"  ❌ Error loading calibration data: {e}")
+        raise
+
+
 def load_reference_extrinsics_for_batch(batch_image_names, reference_calibration_dir):
     """
     Load reference calibration extrinsics for the given batch images.
@@ -413,6 +478,95 @@ def load_reference_extrinsics_for_batch(batch_image_names, reference_calibration
             raise ValueError(f"Failed to load reference calibration from {reference_calibration_dir}")
         
         reference_images = reference_data['images']
+        extrinsics_list = []
+        
+        for image_name in batch_image_names:
+            if image_name in reference_images:
+                extrinsic = reference_images[image_name]['extrinsic']
+                extrinsics_list.append(extrinsic)
+                print(f"    ✅ {image_name}: Found reference extrinsic")
+            else:
+                raise ValueError(f"Image {image_name} not found in reference calibration")
+        
+        # Stack into batch format [B, 3, 4]
+        reference_extrinsics = np.stack(extrinsics_list, axis=0)
+        
+        print(f"  ✅ Loaded reference extrinsics for {len(batch_image_names)} images")
+        return reference_extrinsics
+        
+    except Exception as e:
+        print(f"  ❌ Error loading reference extrinsics: {e}")
+        raise
+
+
+def analyze_3d_point_sharing_from_reconstruction(reconstruction):
+    """
+    Analyze 3D point sharing between images using a pre-loaded reconstruction.
+    
+    Args:
+        reconstruction: pycolmap.Reconstruction object
+    
+    Returns:
+        dict: Same format as analyze_3d_point_sharing
+    """
+    from collections import defaultdict
+    
+    # Initialize data structures
+    image_to_points = defaultdict(set)
+    point_to_images = defaultdict(set)
+    image_names = []
+    
+    # Get all registered image names
+    for image_id, image in reconstruction.images.items():
+        if image.registered:
+            image_names.append(image.name)
+    
+    # Analyze 3D point tracks
+    for point3d_id, point3d in reconstruction.points3D.items():
+        track = point3d.track
+        
+        # Each track element contains image_id and point2D_idx
+        for track_element in track.elements:
+            image_id = track_element.image_id
+            
+            # Get image name from image_id
+            if image_id in reconstruction.images:
+                image = reconstruction.images[image_id]
+                if image.registered:
+                    image_name = image.name
+                    
+                    # Record the association
+                    image_to_points[image_name].add(point3d_id)
+                    point_to_images[point3d_id].add(image_name)
+    
+    print(f"  ✅ Analyzed 3D point sharing for {len(image_names)} images")
+    print(f"  ✅ Found {len(point_to_images)} 3D points with multi-view tracks")
+    
+    return {
+        'image_to_points': dict(image_to_points),
+        'point_to_images': dict(point_to_images), 
+        'image_names': image_names
+    }
+
+
+def load_reference_extrinsics_for_batch_cached(batch_image_names, cached_calibration_data):
+    """
+    Load reference calibration extrinsics for the given batch images using cached data.
+    
+    Args:
+        batch_image_names: List of image names in the batch
+        cached_calibration_data: Pre-loaded calibration data from load_and_cache_calibration_data
+    
+    Returns:
+        np.ndarray: Array of extrinsic matrices [B, 3, 4]
+    """
+    try:
+        colmap_data = cached_calibration_data['colmap_data']
+        
+        if colmap_data is None:
+            raise ValueError("Cached COLMAP calibration data is None")
+        
+        reference_images = colmap_data['images']
         extrinsics_list = []
         
         for image_name in batch_image_names:
@@ -465,7 +619,7 @@ def compute_pointclouds_with_reference_extrinsics(depth_maps, intrinsics, refere
         raise
 
 
-def process_images_for_pointclouds(model, image_paths, dtype, args):
+def process_images_for_pointclouds(model, image_paths, dtype, args, cached_calibration_data):
     """
     Process images in batches to generate and save point clouds.
     Each batch gets its own directory with all related assets.
@@ -490,15 +644,15 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
     use_neighbor_batching = args.use_neighbor_batching and not args.sequential_batching
     
     if use_neighbor_batching:
-        print(f"🔍 Analyzing 3D point sharing in reference calibration...")
-        # Analyze 3D point sharing from reference calibration
-        point_sharing_info = analyze_3d_point_sharing(args.reference_calibration)
+        print(f"🔍 Using cached 3D point sharing analysis...")
+        # Use cached 3D point sharing analysis
+        point_sharing_info = cached_calibration_data['point_sharing_info']
         
         if point_sharing_info is None:
-            print("❌ Failed to analyze 3D point sharing, falling back to sequential batching")
+            print("❌ Failed to get cached point sharing info, falling back to sequential batching")
             use_neighbor_batching = False
         else:
-            print(f"✅ Using neighbor-based batching based on 3D point sharing")
+            print(f"✅ Using neighbor-based batching based on cached 3D point sharing")
             batches = create_neighbor_based_batches(image_paths, point_sharing_info, args.batch_size, args.allow_image_reuse)
     
     if not use_neighbor_batching:
@@ -548,9 +702,9 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
             model, images_for_model, dtype, vggt_model_resolution
         )
         
-        # Load reference calibration extrinsics for the batch images
+        # Load reference calibration extrinsics for the batch images using cached data
         print(f"  🔄 Loading reference extrinsics for batch images...")
-        reference_extrinsics = load_reference_extrinsics_for_batch(batch_image_names, args.reference_calibration)
+        reference_extrinsics = load_reference_extrinsics_for_batch_cached(batch_image_names, cached_calibration_data)
         
         # Save raw data if requested
         if args.save_raw_data:
@@ -577,8 +731,16 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
             save_individual_camera_parameters(vggt_extrinsic_batch, intrinsic_batch, batch_image_names, individual_cameras_dir)
         
 
-        # Estimate scale from the batch to the reference calibration
-        scale_result = estimate_scale_only_from_recons(vggt_calibration_dir, args.reference_calibration, robust_scale=True)
+        # Estimate scale from the batch to the reference calibration using cached data
+        # First load the source poses from the saved VGGT calibration
+        from utils.reconstruction_transform import load_reconstruction, extract_camera_centers_and_rotations, estimate_scale_only_from_cached_data
+        source_reconstruction = load_reconstruction(vggt_calibration_dir)
+        source_poses = extract_camera_centers_and_rotations(source_reconstruction)
+        
+        # Use cached target poses
+        target_poses = cached_calibration_data['camera_poses']
+        
+        scale_result = estimate_scale_only_from_cached_data(source_poses, target_poses, robust_scale=True)
         estimated_scale = scale_result['scale']
         
         print("=== Scale Estimation (source -> target) ===")
@@ -1140,8 +1302,11 @@ def main():
     
     print(f"Found {len(image_path_list)} images")
 
+    # Load calibration data once for all batches
+    cached_calibration_data = load_and_cache_calibration_data(args.reference_calibration)
+
     # Process images in batches to generate point clouds
-    process_images_for_pointclouds(model, image_path_list, dtype, args)
+    process_images_for_pointclouds(model, image_path_list, dtype, args, cached_calibration_data)
     
     print(f"🎉 Point cloud estimation completed successfully!")
     print(f"📁 Results saved to: {args.output_dir}")

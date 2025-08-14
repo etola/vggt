@@ -428,6 +428,45 @@ def estimate_scale_only_from_recons(
     }
 
 
+def estimate_scale_only_from_cached_data(
+    source_poses: Dict,
+    target_poses: Dict,
+    robust_scale: bool = True,
+) -> Dict:
+    """Estimate only the scale factor aligning source to target using pre-loaded camera poses.
+    
+    This is an optimized version of estimate_scale_only_from_recons that uses pre-loaded
+    camera pose data instead of loading reconstructions from disk.
+    
+    Args:
+        source_poses: Camera poses from extract_camera_centers_and_rotations for source
+        target_poses: Camera poses from extract_camera_centers_and_rotations for target  
+        robust_scale: Whether to use robust scale estimation (median of pairwise ratios)
+        
+    Returns:
+        Dict with keys: 'scale', 'rmse_estimate', 'num_common', 'common_images'
+    """
+    common = match_common_image_names(source_poses, target_poses)
+
+    src_centers = np.asarray([source_poses[name]["center"] for name in common], dtype=float)
+    dst_centers = np.asarray([target_poses[name]["center"] for name in common], dtype=float)
+
+    scale = estimate_scale_from_centers(src_centers, dst_centers, robust=robust_scale)
+    
+    # Compute a simple scale-only RMSE for validation
+    # This applies only scale transformation: scaled_src = scale * src_centers
+    # Then computes RMS distance to dst_centers (won't be perfect since no rotation/translation)
+    scaled_src = scale * src_centers
+    scale_only_rmse = float(np.sqrt(np.mean(np.sum((scaled_src - dst_centers) ** 2, axis=1))))
+
+    return {
+        "scale": scale,
+        "rmse_estimate": scale_only_rmse,
+        "num_common": len(common),
+        "common_images": common,
+    }
+
+
 def extract_camera_poses(reconstruction: pycolmap.Reconstruction) -> Dict[str, Dict[str, np.ndarray]]:
     """Extract camera poses (positions and orientations) from reconstruction.
     
