@@ -295,11 +295,32 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
 
 
         # --- Save Combined Batch Point Cloud ---
-        # Flatten all points, confidences, and colors from the batch
+        # Flatten all points and confidences from the batch
         batch_points_flat = points_3d_batch.reshape(-1, 3)
         batch_conf_flat = depth_conf_batch.flatten()
-        batch_colors_np = images_for_color.permute(0, 2, 3, 1).numpy()
-        batch_colors_flat = (batch_colors_np.reshape(-1, 3) * 255).astype(np.uint8)
+        
+        # Load and process original images for accurate color sampling
+        batch_colors_list = []
+        images_dir = os.path.join(args.scene_dir, "images")
+        
+        for i, image_path in enumerate(batch_paths):
+            if os.path.exists(image_path):
+                # Load and resize original image to match depth map resolution
+                image = Image.open(image_path).convert('RGB')
+                depth_h, depth_w = depth_conf_batch[i].shape
+                image_resized = image.resize((depth_w, depth_h), Image.Resampling.LANCZOS)
+                image_array = np.array(image_resized)  # HxWx3, uint8 [0, 255]
+                batch_colors_list.append(image_array)
+            else:
+                print(f"⚠️  Warning: Original image not found at {image_path}, using gray colors")
+                # Fallback to gray colors
+                depth_h, depth_w = depth_conf_batch[i].shape
+                gray_image = np.full((depth_h, depth_w, 3), 128, dtype=np.uint8)
+                batch_colors_list.append(gray_image)
+        
+        # Stack all color images and flatten
+        batch_colors_np = np.stack(batch_colors_list, axis=0)  # [B, H, W, 3]
+        batch_colors_flat = batch_colors_np.reshape(-1, 3)
 
         # Filter the combined points
         combined_conf_mask = batch_conf_flat > args.conf_threshold
@@ -326,11 +347,24 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
             conf_mask = frame_conf > args.conf_threshold
             filtered_points = frame_points[conf_mask]
             
-            # Get colors for the points
-            color_image = images_for_color[i]
-            color_image_np = color_image.permute(1, 2, 0).numpy() # HxWx3
-            filtered_colors = color_image_np[conf_mask]
-            filtered_colors = (filtered_colors * 255).astype(np.uint8)
+            # Load original image for accurate color sampling
+            images_dir = os.path.join(args.scene_dir, "images")
+            original_image_path = batch_paths[i]
+            
+            if os.path.exists(original_image_path):
+                # Load and resize original image to match depth map resolution
+                image = Image.open(original_image_path).convert('RGB')
+                depth_h, depth_w = frame_conf.shape
+                image_resized = image.resize((depth_w, depth_h), Image.Resampling.LANCZOS)
+                image_array = np.array(image_resized)  # HxWx3, uint8 [0, 255]
+                
+                # Sample colors using the confidence mask
+                filtered_colors = image_array[conf_mask]
+            else:
+                print(f"⚠️  Warning: Original image not found at {original_image_path}, using gray colors")
+                # Fallback to gray colors
+                filtered_colors = np.zeros((len(filtered_points), 3), dtype=np.uint8)
+                filtered_colors[:, :] = 128
             
             # Save individual point cloud
             output_filename = os.path.join(ply_output_dir, f"{file_name_no_ext}.ply")
