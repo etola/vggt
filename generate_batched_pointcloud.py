@@ -687,48 +687,97 @@ def process_images_for_pointclouds(model, image_paths, dtype, args, cached_calib
             os.makedirs(individual_cameras_dir, exist_ok=True)
         os.makedirs(vggt_calibration_dir, exist_ok=True)
         
-        # Load batch with aspect-ratio preservation
-        images, _ = load_and_preprocess_images_square(batch_paths, args.resolution)
+        # Optimize image loading when only saving first image
+        if args.save_first_only:
+            print(f"  🚀 Optimizing for first-image-only processing...")
+            # For scale estimation, we need at least 2 images, so process first 2 images minimum
+            min_images_for_scale = min(2, len(batch_paths))
+            scale_estimation_paths = batch_paths[:min_images_for_scale]
+            images, _ = load_and_preprocess_images_square(scale_estimation_paths, args.resolution)
+            print(f"  📐 Processing {min_images_for_scale} images for scale estimation, saving point cloud for first only")
+        else:
+            # Load all batch images (normal behavior)
+            images, _ = load_and_preprocess_images_square(batch_paths, args.resolution)
         
         # Resize to model resolution
         images_for_model = F.interpolate(images, size=(vggt_model_resolution, vggt_model_resolution), mode="bilinear", align_corners=False)
         images_for_model = images_for_model.to(next(model.parameters()).device)
 
-        # Get batch image names for reference loading and similarity transform
-        batch_image_names = [os.path.basename(p) for p in batch_paths]
+        # Get image names for processing (scale estimation vs full batch)
+        if args.save_first_only:
+            # Process minimum images needed for scale estimation
+            min_images_for_scale = min(2, len(batch_paths))
+            scale_estimation_paths = batch_paths[:min_images_for_scale]
+            scale_estimation_names = [os.path.basename(p) for p in scale_estimation_paths]
+            batch_image_names = [os.path.basename(p) for p in batch_paths]  # Keep original for metadata
+            
+            print(f"  🔄 Loading reference extrinsics for scale estimation images...")
+            reference_extrinsics_for_scale = load_reference_extrinsics_for_batch_cached(scale_estimation_names, cached_calibration_data)
+            # Only need reference extrinsic for first image for point cloud computation
+            reference_extrinsics = reference_extrinsics_for_scale[0:1]
+            
+        else:
+            # Process all batch images (normal behavior)
+            batch_image_names = [os.path.basename(p) for p in batch_paths]
+            scale_estimation_names = batch_image_names
+            
+            print(f"  🔄 Loading reference extrinsics for batch images...")
+            reference_extrinsics = load_reference_extrinsics_for_batch_cached(batch_image_names, cached_calibration_data)
+            reference_extrinsics_for_scale = reference_extrinsics
         
         # Process batch to get depth maps and VGGT intrinsics
         depth_conf_batch, depth_map_batch, images_for_color, vggt_extrinsic_batch, intrinsic_batch = run_VGGT_batch_pointcloud(
             model, images_for_model, dtype, vggt_model_resolution
         )
         
-        # Load reference calibration extrinsics for the batch images using cached data
-        print(f"  🔄 Loading reference extrinsics for batch images...")
-        reference_extrinsics = load_reference_extrinsics_for_batch_cached(batch_image_names, cached_calibration_data)
-        
         # Save raw data if requested
         if args.save_raw_data:
-            for i in range(len(batch_paths)):
-                base_name = os.path.splitext(batch_image_names[i])[0]
+            # When save_first_only is True, only save data for the first image
+            if args.save_first_only:
+                base_name = os.path.splitext(batch_image_names[0])[0]
                 
-                # Save raw depth and confidence maps
+                # Save raw depth and confidence maps for first image only
                 depth_file = os.path.join(raw_data_dir, f"{base_name}_depth.npy")
                 conf_file = os.path.join(raw_data_dir, f"{base_name}_confidence.npy")
                 
-                np.save(depth_file, depth_map_batch[i])
-                np.save(conf_file, depth_conf_batch[i])
+                np.save(depth_file, depth_map_batch[0])
+                np.save(conf_file, depth_conf_batch[0])
                 print(f"  Saved raw depth map to {depth_file}")
                 print(f"  Saved confidence map to {conf_file}")
+            else:
+                # Save for all images
+                for i in range(len(batch_paths)):
+                    base_name = os.path.splitext(batch_image_names[i])[0]
+                    
+                    # Save raw depth and confidence maps
+                    depth_file = os.path.join(raw_data_dir, f"{base_name}_depth.npy")
+                    conf_file = os.path.join(raw_data_dir, f"{base_name}_confidence.npy")
+                    
+                    np.save(depth_file, depth_map_batch[i])
+                    np.save(conf_file, depth_conf_batch[i])
+                    print(f"  Saved raw depth map to {depth_file}")
+                    print(f"  Saved confidence map to {conf_file}")
         
         # Save COLMAP format calibration (using VGGT extrinsics + intrinsics for scale estimation)
-        save_vggt_calibration_as_colmap(
-            [vggt_extrinsic_batch], [intrinsic_batch], [batch_image_names], 
-            vggt_calibration_dir, vggt_model_resolution
-        )
-        
-        # Save individual camera parameters (for generate_cloud.py) - using VGGT extrinsics
-        if args.save_raw_data:
-            save_individual_camera_parameters(vggt_extrinsic_batch, intrinsic_batch, batch_image_names, individual_cameras_dir)
+        if args.save_first_only:
+            # Save scale estimation images' calibration data (minimum 2 for scale estimation)
+            min_images_for_scale = min(2, len(batch_paths))
+            save_vggt_calibration_as_colmap(
+                [vggt_extrinsic_batch[:min_images_for_scale]], [intrinsic_batch[:min_images_for_scale]], [scale_estimation_names], 
+                vggt_calibration_dir, vggt_model_resolution
+            )
+            # Save individual camera parameters (for generate_cloud.py) - using VGGT extrinsics
+            if args.save_raw_data:
+                save_individual_camera_parameters(vggt_extrinsic_batch[:1], intrinsic_batch[:1], [batch_image_names[0]], individual_cameras_dir)
+        else:
+            # Save all images' calibration data
+            save_vggt_calibration_as_colmap(
+                [vggt_extrinsic_batch], [intrinsic_batch], [batch_image_names], 
+                vggt_calibration_dir, vggt_model_resolution
+            )
+            # Save individual camera parameters (for generate_cloud.py) - using VGGT extrinsics
+            if args.save_raw_data:
+                save_individual_camera_parameters(vggt_extrinsic_batch, intrinsic_batch, batch_image_names, individual_cameras_dir)
         
 
         # Estimate scale from the batch to the reference calibration using cached data
@@ -768,11 +817,21 @@ def process_images_for_pointclouds(model, image_paths, dtype, args, cached_calib
         # Scale the depth maps with the estimated scale
         scaled_depth_maps = depth_map_batch * estimated_scale
         
-        # Recompute point clouds using scaled depth maps with reference extrinsics  
-        print(f"  🔄 Computing point clouds with scaled depth maps...")
-        points_3d_batch = compute_pointclouds_with_reference_extrinsics(
-            scaled_depth_maps, intrinsic_batch, reference_extrinsics
-        )
+        # Compute point clouds using scaled depth maps with reference extrinsics  
+        if args.save_first_only:
+            print(f"  🔄 Computing point cloud for first image only...")
+            # Only compute for the first image when save_first_only is enabled
+            # Use only first image's data for point cloud computation
+            first_depth_only = scaled_depth_maps[0:1]  # [1, H, W]
+            first_intrinsic_only = intrinsic_batch[0:1]  # [1, 3, 3]
+            points_3d_batch = compute_pointclouds_with_reference_extrinsics(
+                first_depth_only, first_intrinsic_only, reference_extrinsics
+            )
+        else:
+            print(f"  🔄 Computing point clouds with scaled depth maps...")
+            points_3d_batch = compute_pointclouds_with_reference_extrinsics(
+                scaled_depth_maps, intrinsic_batch, reference_extrinsics
+            )
         
         print(f"  ✅ Point clouds computed with correct scale and reference poses")
         
@@ -781,47 +840,55 @@ def process_images_for_pointclouds(model, image_paths, dtype, args, cached_calib
 
         # Save reference extrinsics to transformed directory as the final output
         print(f"  💾 Saving reference extrinsics to transformed directory...")
-        save_vggt_calibration_as_colmap(
-            [reference_extrinsics], [intrinsic_batch], [batch_image_names], 
-            transformed_dir, vggt_model_resolution
-        )
+        if args.save_first_only:
+            # Only save first image's reference calibration to transformed directory  
+            first_intrinsic_only = intrinsic_batch[0:1]  # [1, 3, 3]
+            save_vggt_calibration_as_colmap(
+                [reference_extrinsics], [first_intrinsic_only], [batch_image_names[0:1]], 
+                transformed_dir, vggt_model_resolution
+            )
+        else:
+            save_vggt_calibration_as_colmap(
+                [reference_extrinsics], [intrinsic_batch], [batch_image_names], 
+                transformed_dir, vggt_model_resolution
+            )
         print(f"  ✅ Saved reference calibration as final transformed output")
 
-        # --- Save Combined Batch Point Cloud ---
-        # Flatten all points and confidences from the batch
-        batch_points_flat = points_3d_batch.reshape(-1, 3)
-        batch_conf_flat = depth_conf_batch.flatten()
-        
-        # Load and process original images for accurate color sampling
-        batch_colors_list = []
-        images_dir = os.path.join(args.scene_dir, "images")
-        
-        for i, image_path in enumerate(batch_paths):
-            if os.path.exists(image_path):
-                # Load and resize original image to match depth map resolution
-                image = Image.open(image_path).convert('RGB')
-                depth_h, depth_w = depth_conf_batch[i].shape
-                image_resized = image.resize((depth_w, depth_h), Image.Resampling.LANCZOS)
-                image_array = np.array(image_resized)  # HxWx3, uint8 [0, 255]
-                batch_colors_list.append(image_array)
-            else:
-                print(f"⚠️  Warning: Original image not found at {image_path}, using gray colors")
-                # Fallback to gray colors
-                depth_h, depth_w = depth_conf_batch[i].shape
-                gray_image = np.full((depth_h, depth_w, 3), 128, dtype=np.uint8)
-                batch_colors_list.append(gray_image)
-        
-        # Stack all color images and flatten
-        batch_colors_np = np.stack(batch_colors_list, axis=0)  # [B, H, W, 3]
-        batch_colors_flat = batch_colors_np.reshape(-1, 3)
-
-        # Filter the combined points
-        combined_conf_mask = batch_conf_flat > args.conf_threshold
-        combined_filtered_points = batch_points_flat[combined_conf_mask]
-        combined_filtered_colors = batch_colors_flat[combined_conf_mask]
-        
-        # Save the combined point cloud directly to transformed directory (unless saving first only)
+        # --- Save Combined Batch Point Cloud (only when not save_first_only) ---
         if not args.save_first_only:
+            # Flatten all points and confidences from the batch
+            batch_points_flat = points_3d_batch.reshape(-1, 3)
+            batch_conf_flat = depth_conf_batch.flatten()
+            
+            # Load and process original images for accurate color sampling
+            batch_colors_list = []
+            images_dir = os.path.join(args.scene_dir, "images")
+            
+            for i, image_path in enumerate(batch_paths):
+                if os.path.exists(image_path):
+                    # Load and resize original image to match depth map resolution
+                    image = Image.open(image_path).convert('RGB')
+                    depth_h, depth_w = depth_conf_batch[i].shape
+                    image_resized = image.resize((depth_w, depth_h), Image.Resampling.LANCZOS)
+                    image_array = np.array(image_resized)  # HxWx3, uint8 [0, 255]
+                    batch_colors_list.append(image_array)
+                else:
+                    print(f"⚠️  Warning: Original image not found at {image_path}, using gray colors")
+                    # Fallback to gray colors
+                    depth_h, depth_w = depth_conf_batch[i].shape
+                    gray_image = np.full((depth_h, depth_w, 3), 128, dtype=np.uint8)
+                    batch_colors_list.append(gray_image)
+            
+            # Stack all color images and flatten
+            batch_colors_np = np.stack(batch_colors_list, axis=0)  # [B, H, W, 3]
+            batch_colors_flat = batch_colors_np.reshape(-1, 3)
+
+            # Filter the combined points
+            combined_conf_mask = batch_conf_flat > args.conf_threshold
+            combined_filtered_points = batch_points_flat[combined_conf_mask]
+            combined_filtered_colors = batch_colors_flat[combined_conf_mask]
+            
+            # Save the combined point cloud directly to transformed directory
             if combined_filtered_points.shape[0] > 0:
                 try:
                     transformed_combined_path = os.path.join(transformed_dir, "batch.ply")
@@ -836,23 +903,28 @@ def process_images_for_pointclouds(model, image_paths, dtype, args, cached_calib
         
         # --- Save Individual Frame Outputs ---
         # Save point cloud: if save_first_only=True, save only first image's point cloud
-        frame_indices = [0] if args.save_first_only else []  # Only process first image if saving first only
+        if args.save_first_only:
+            # When save_first_only is True, we computed point clouds only for the first image
+            # The point cloud data is at index 0 in points_3d_batch (which has shape [1, H, W, 3])
+            frame_indices = [0]
+            base_name = os.path.basename(batch_paths[0])  # Always use the first batch path
+        else:
+            frame_indices = []  # Don't save individual frames when processing full batch
         
         for i in frame_indices:
-            base_name = os.path.basename(batch_paths[i])
             file_name_no_ext = os.path.splitext(base_name)[0]
 
             # --- Save Point Cloud ---
-            frame_points = points_3d_batch[i]       # HxWx3
-            frame_conf = depth_conf_batch[i]         # HxW
+            frame_points = points_3d_batch[i]       # HxWx3 (always index 0 when save_first_only=True)
+            frame_conf = depth_conf_batch[i]         # HxW (use first image's confidence)
             
             # Filter points based on confidence
             conf_mask = frame_conf > args.conf_threshold
             filtered_points = frame_points[conf_mask]
             
-            # Load original image for accurate color sampling
+            # Load original image for accurate color sampling  
             images_dir = os.path.join(args.scene_dir, "images")
-            original_image_path = batch_paths[i]
+            original_image_path = batch_paths[0] if args.save_first_only else batch_paths[i]
             
             if os.path.exists(original_image_path):
                 # Load and resize original image to match depth map resolution
@@ -884,7 +956,7 @@ def process_images_for_pointclouds(model, image_paths, dtype, args, cached_calib
             
             # --- Save Depth Map (if raw data saving is enabled) ---
             if args.save_raw_data:
-                frame_depth = depth_map_batch[i]
+                frame_depth = depth_map_batch[i]  # Index 0 when save_first_only=True
                 colored_depth = colorize_depth_map(frame_depth, cmap=args.colormap)
                 
                 depth_output_filename = os.path.join(depth_output_dir, f"{file_name_no_ext}_depth.png")
@@ -892,7 +964,10 @@ def process_images_for_pointclouds(model, image_paths, dtype, args, cached_calib
                 print(f"  Saved depth map to {depth_output_filename}")
 
         # Save batch-specific metadata
-        save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_idx, use_neighbor_batching)
+        if args.save_first_only:
+            save_batch_metadata(args, [batch_paths[0]], [batch_image_names[0]], batch_dir, batch_idx, use_neighbor_batching)
+        else:
+            save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_idx, use_neighbor_batching)
 
         # Aggressive memory cleanup
         del images, images_for_model, points_3d_batch, depth_conf_batch, depth_map_batch, images_for_color
