@@ -18,7 +18,7 @@ Batching Strategies:
 
 Point Cloud Computation:
     - Uses VGGT intrinsics with reference calibration extrinsics for unprojection
-    - Saves VGGT extrinsics to colmap_calibration/ for scale estimation against reference
+    - Saves VGGT extrinsics to vggt_calibration/ for scale estimation against reference
     - Scales VGGT depth maps with estimated scale before unprojection 
     - Recomputes point clouds with scaled depth maps and reference extrinsics
     - Sets transform scale to 1.0 (no additional scaling needed)
@@ -36,7 +36,7 @@ Output Structure:
     │   ├── depth/                   # Colorized depth maps (.png)
     │   ├── raw_data/                # Raw depth & confidence (.npy)
     │   ├── individual_cameras/      # Camera parameters (.npy)
-    │   ├── colmap_calibration/      # VGGT calibration (for scale estimation)
+    │   ├── vggt_calibration/      # VGGT calibration (for scale estimation)
     │   ├── transformed/             # Reference calibration & transform results
     │   │   ├── transform.json       # Transform parameters
     │   │   ├── cameras.txt          # Reference COLMAP calibration (final output)
@@ -546,7 +546,7 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         ply_output_dir = os.path.join(batch_dir, "ply")
         depth_output_dir = os.path.join(batch_dir, "depth")
         raw_data_dir = os.path.join(batch_dir, "raw_data")
-        colmap_dir = os.path.join(batch_dir, "colmap_calibration")
+        vggt_calibration_dir = os.path.join(batch_dir, "vggt_calibration")
         individual_cameras_dir = os.path.join(batch_dir, "individual_cameras")
         transformed_dir = os.path.join(batch_dir, "transformed")
         
@@ -555,7 +555,7 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         if args.save_raw_data:
             os.makedirs(raw_data_dir, exist_ok=True)
             os.makedirs(individual_cameras_dir, exist_ok=True)
-        os.makedirs(colmap_dir, exist_ok=True)
+        os.makedirs(vggt_calibration_dir, exist_ok=True)
         
         # Load batch with aspect-ratio preservation
         images, _ = load_and_preprocess_images_square(batch_paths, args.resolution)
@@ -576,12 +576,6 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         print(f"  🔄 Loading reference extrinsics for batch images...")
         reference_extrinsics = load_reference_extrinsics_for_batch(batch_image_names, args.reference_calibration)
         
-        # Recompute point clouds using VGGT intrinsics but reference extrinsics
-        print(f"  🔄 Recomputing point clouds with reference extrinsics...")
-        points_3d_batch = recompute_pointclouds_with_reference_extrinsics(
-            depth_map_batch, intrinsic_batch, reference_extrinsics
-        )
-        
         # Save raw data if requested
         if args.save_raw_data:
             for i in range(len(batch_paths)):
@@ -599,7 +593,7 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         # Save COLMAP format calibration (using VGGT extrinsics + intrinsics for scale estimation)
         save_vggt_calibration_as_colmap(
             [vggt_extrinsic_batch], [intrinsic_batch], [batch_image_names], 
-            colmap_dir, vggt_model_resolution
+            vggt_calibration_dir, vggt_model_resolution
         )
         
         # Save individual camera parameters (for generate_cloud.py) - using VGGT extrinsics
@@ -608,7 +602,7 @@ def process_images_for_pointclouds(model, image_paths, dtype, args):
         
 
         # compute the similarity transform from the batch to the reference calibration
-        full_transform = get_batch_transform(colmap_dir, args.reference_calibration, transformed_dir)
+        full_transform = get_batch_transform(vggt_calibration_dir, args.reference_calibration, transformed_dir)
         estimated_scale = full_transform['scale']
         
         print(f"  📐 Estimated scale: {estimated_scale:.6f}")
@@ -885,7 +879,7 @@ def save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_i
             'depth_dir': 'depth/',
             'raw_data_dir': 'raw_data/' if args.save_raw_data else None,
             'individual_cameras_dir': 'individual_cameras/' if args.save_raw_data else None,
-            'colmap_calibration_dir': 'colmap_calibration/',
+            'vggt_calibration_dir': 'vggt_calibration/',
             'transformed_dir': 'transformed/',
             'transformed_ply_dir': 'transformed/ply/'
         },
@@ -900,7 +894,7 @@ def save_batch_metadata(args, batch_paths, batch_image_names, batch_dir, batch_i
             'confidence': '.npy (numpy array, float32)',
             'extrinsics': '.npy (numpy array, shape [3, 4])',
             'intrinsics': '.npy (numpy array, shape [3, 3])',
-            'colmap_calibration': 'COLMAP sparse reconstruction format (cameras.txt, images.txt, points3D.txt)',
+            'vggt_calibration': 'VGGT sparse reconstruction format (cameras.txt, images.txt, points3D.txt)',
             'transform_data': 'transform.json (similarity transform parameters)'
         }
     }
@@ -945,7 +939,7 @@ def save_processing_metadata(args, image_paths, output_dir):
             'depth_dir': 'depth/',
             'raw_data_dir': 'raw_data/' if args.save_raw_data else None,
             'individual_cameras_dir': 'individual_cameras/' if args.save_raw_data else None,
-            'colmap_calibration_dir': 'colmap_calibration/',
+            'vggt_calibration_dir': 'vggt_calibration/',
             'transformed_dir': 'transformed/',
             'transformed_ply_dir': 'transformed/ply/',
             'batch_metadata': 'batch_metadata.json'
@@ -961,7 +955,7 @@ def save_processing_metadata(args, image_paths, output_dir):
             'confidence': '.npy (numpy array, float32)',
             'extrinsics': '.npy (numpy array, shape [3, 4])',
             'intrinsics': '.npy (numpy array, shape [3, 3])',
-            'colmap_calibration': 'COLMAP sparse reconstruction format (cameras.txt, images.txt, points3D.txt)',
+            'vggt_calibration': 'VGGT sparse reconstruction format (cameras.txt, images.txt, points3D.txt)',
             'transform_data': 'transform.json (similarity transform parameters)'
         },
         'data_info': {
