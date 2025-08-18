@@ -687,43 +687,19 @@ def process_images_for_pointclouds(model, image_paths, dtype, args, cached_calib
             os.makedirs(individual_cameras_dir, exist_ok=True)
         os.makedirs(vggt_calibration_dir, exist_ok=True)
         
-        # Optimize image loading when only saving first image
-        if args.save_first_only:
-            print(f"  🚀 Optimizing for first-image-only processing...")
-            # For scale estimation, we need at least 2 images, so process first 2 images minimum
-            min_images_for_scale = min(2, len(batch_paths))
-            scale_estimation_paths = batch_paths[:min_images_for_scale]
-            images, _ = load_and_preprocess_images_square(scale_estimation_paths, args.resolution)
-            print(f"  📐 Processing {min_images_for_scale} images for scale estimation, saving point cloud for first only")
-        else:
-            # Load all batch images (normal behavior)
-            images, _ = load_and_preprocess_images_square(batch_paths, args.resolution)
+        # Load all batch images (always process full batch for VGGT and scale estimation)
+        images, _ = load_and_preprocess_images_square(batch_paths, args.resolution)
         
         # Resize to model resolution
         images_for_model = F.interpolate(images, size=(vggt_model_resolution, vggt_model_resolution), mode="bilinear", align_corners=False)
         images_for_model = images_for_model.to(next(model.parameters()).device)
 
-        # Get image names for processing (scale estimation vs full batch)
-        if args.save_first_only:
-            # Process minimum images needed for scale estimation
-            min_images_for_scale = min(2, len(batch_paths))
-            scale_estimation_paths = batch_paths[:min_images_for_scale]
-            scale_estimation_names = [os.path.basename(p) for p in scale_estimation_paths]
-            batch_image_names = [os.path.basename(p) for p in batch_paths]  # Keep original for metadata
-            
-            print(f"  🔄 Loading reference extrinsics for scale estimation images...")
-            reference_extrinsics_for_scale = load_reference_extrinsics_for_batch_cached(scale_estimation_names, cached_calibration_data)
-            # Only need reference extrinsic for first image for point cloud computation
-            reference_extrinsics = reference_extrinsics_for_scale[0:1]
-            
-        else:
-            # Process all batch images (normal behavior)
-            batch_image_names = [os.path.basename(p) for p in batch_paths]
-            scale_estimation_names = batch_image_names
-            
-            print(f"  🔄 Loading reference extrinsics for batch images...")
-            reference_extrinsics = load_reference_extrinsics_for_batch_cached(batch_image_names, cached_calibration_data)
-            reference_extrinsics_for_scale = reference_extrinsics
+        # Get batch image names for reference loading and similarity transform
+        batch_image_names = [os.path.basename(p) for p in batch_paths]
+        
+        # Load reference calibration extrinsics for all batch images using cached data
+        print(f"  🔄 Loading reference extrinsics for batch images...")
+        reference_extrinsics = load_reference_extrinsics_for_batch_cached(batch_image_names, cached_calibration_data)
         
         # Process batch to get depth maps and VGGT intrinsics
         depth_conf_batch, depth_map_batch, images_for_color, vggt_extrinsic_batch, intrinsic_batch = run_VGGT_batch_pointcloud(
@@ -732,8 +708,8 @@ def process_images_for_pointclouds(model, image_paths, dtype, args, cached_calib
         
         # Save raw data if requested
         if args.save_raw_data:
-            # When save_first_only is True, only save data for the first image
             if args.save_first_only:
+                # When save_first_only is True, only save data for the first image
                 base_name = os.path.splitext(batch_image_names[0])[0]
                 
                 # Save raw depth and confidence maps for first image only
@@ -759,24 +735,17 @@ def process_images_for_pointclouds(model, image_paths, dtype, args, cached_calib
                     print(f"  Saved confidence map to {conf_file}")
         
         # Save COLMAP format calibration (using VGGT extrinsics + intrinsics for scale estimation)
-        if args.save_first_only:
-            # Save scale estimation images' calibration data (minimum 2 for scale estimation)
-            min_images_for_scale = min(2, len(batch_paths))
-            save_vggt_calibration_as_colmap(
-                [vggt_extrinsic_batch[:min_images_for_scale]], [intrinsic_batch[:min_images_for_scale]], [scale_estimation_names], 
-                vggt_calibration_dir, vggt_model_resolution
-            )
-            # Save individual camera parameters (for generate_cloud.py) - using VGGT extrinsics
-            if args.save_raw_data:
+        save_vggt_calibration_as_colmap(
+            [vggt_extrinsic_batch], [intrinsic_batch], [batch_image_names], 
+            vggt_calibration_dir, vggt_model_resolution
+        )
+        
+        # Save individual camera parameters (for generate_cloud.py) - using VGGT extrinsics
+        if args.save_raw_data:
+            if args.save_first_only:
+                # Only save first image's individual camera parameters when save_first_only
                 save_individual_camera_parameters(vggt_extrinsic_batch[:1], intrinsic_batch[:1], [batch_image_names[0]], individual_cameras_dir)
-        else:
-            # Save all images' calibration data
-            save_vggt_calibration_as_colmap(
-                [vggt_extrinsic_batch], [intrinsic_batch], [batch_image_names], 
-                vggt_calibration_dir, vggt_model_resolution
-            )
-            # Save individual camera parameters (for generate_cloud.py) - using VGGT extrinsics
-            if args.save_raw_data:
+            else:
                 save_individual_camera_parameters(vggt_extrinsic_batch, intrinsic_batch, batch_image_names, individual_cameras_dir)
         
 
@@ -824,8 +793,9 @@ def process_images_for_pointclouds(model, image_paths, dtype, args, cached_calib
             # Use only first image's data for point cloud computation
             first_depth_only = scaled_depth_maps[0:1]  # [1, H, W]
             first_intrinsic_only = intrinsic_batch[0:1]  # [1, 3, 3]
+            first_reference_extrinsic = reference_extrinsics[0:1]  # [1, 3, 4]
             points_3d_batch = compute_pointclouds_with_reference_extrinsics(
-                first_depth_only, first_intrinsic_only, reference_extrinsics
+                first_depth_only, first_intrinsic_only, first_reference_extrinsic
             )
         else:
             print(f"  🔄 Computing point clouds with scaled depth maps...")
@@ -843,8 +813,9 @@ def process_images_for_pointclouds(model, image_paths, dtype, args, cached_calib
         if args.save_first_only:
             # Only save first image's reference calibration to transformed directory  
             first_intrinsic_only = intrinsic_batch[0:1]  # [1, 3, 3]
+            first_reference_extrinsic = reference_extrinsics[0:1]  # [1, 3, 4]
             save_vggt_calibration_as_colmap(
-                [reference_extrinsics], [first_intrinsic_only], [batch_image_names[0:1]], 
+                [first_reference_extrinsic], [first_intrinsic_only], [batch_image_names[0:1]], 
                 transformed_dir, vggt_model_resolution
             )
         else:
