@@ -24,17 +24,23 @@ Point Cloud Computation:
     - Estimates scale factor between VGGT and reference coordinate systems
     - Scales VGGT depth maps with estimated scale before unprojection 
     - Computes point clouds with scaled depth maps and reference extrinsics
+    - Compares dense vs sparse point clouds and computes robust linear transform (ax+b)
+    - Generates linearly corrected point clouds using sparse-dense alignment
     - Saves reference extrinsics to transformed/ as final output
     - Results are directly in reference coordinate system with correct scale
 
 Output Structure:
     output_dir/
     ├── pointcloud.ply               # Global combined point cloud (all batches)
+    ├── corrected_pointcloud.ply     # Global corrected point cloud (linearly aligned)
     ├── batch_000/
     │   ├── depth/                   # Colorized depth maps (.png) [only with --save_raw_data]
     │   ├── raw_data/                # Raw depth & confidence (.npy) [only with --save_raw_data]
     │   ├── individual_cameras/      # Camera parameters (.npy) [only with --save_raw_data]
     │   ├── vggt_calibration/        # VGGT calibration (for scale estimation)
+    │   ├── corrected/               # Linearly corrected point clouds (new)
+    │   │   ├── corrected_batch.ply  # Point cloud corrected using sparse-dense alignment
+    │   │   └── linear_transform.json# Linear transform parameters (a, b) and stats
     │   ├── transformed/             # Final output in reference coordinate system
     │   │   ├── scale.json           # Scale estimation info
     │   │   ├── cameras.txt          # Reference COLMAP calibration
@@ -587,6 +593,250 @@ def load_reference_extrinsics_for_batch_cached(batch_image_names, cached_calibra
         print(f"  ❌ Error loading reference extrinsics: {e}")
         raise
 
+def compare_dense_vs_sparse_pointclouds(points_3d_batch, scaled_depth_maps, intrinsic_batch, 
+                                       reference_extrinsics, colmap_reconstruction, 
+                                       batch_image_names, vggt_model_resolution):
+    """
+    Compare dense point cloud from depth map with sparse SFM point cloud.
+    
+    This function finds visible SFM points from the first frame in the batch,
+    projects them onto the depth map using camera extrinsics and intrinsics, 
+    and compares scaled depth map depths with the actual SFM point depths 
+    to compute scale difference and translation.
+    
+    Args:
+        points_3d_batch: Dense 3D points from depth maps [B, H, W, 3]
+        scaled_depth_maps: Scaled depth maps [B, H, W]
+        intrinsic_batch: Intrinsic matrices [B, 3, 3]
+        reference_extrinsics: Reference extrinsic matrices [B, 3, 4]
+        colmap_reconstruction: pycolmap.Reconstruction object with sparse points
+        batch_image_names: List of image names in the batch
+        vggt_model_resolution: Resolution used by VGGT model
+        
+    Returns:
+        dict: Analysis results with scale difference and translation info
+    """
+    try:
+        # Focus on the first frame of the batch
+        first_image_name = batch_image_names[0]
+        first_depth_map = scaled_depth_maps[0]  # [H, W]
+        first_intrinsic = intrinsic_batch[0]    # [3, 3]
+        first_extrinsic = reference_extrinsics[0]  # [3, 4]
+        first_points_3d = points_3d_batch[0]    # [H, W, 3]
+        
+        print(f"\n  🔍 Comparing dense vs sparse point clouds for first frame: {first_image_name}")
+        
+        # Get the image ID from COLMAP reconstruction
+        image_id = None
+        colmap_image = None
+        for img_id, img in colmap_reconstruction.images.items():
+            if img.name == first_image_name:
+                image_id = img_id
+                colmap_image = img
+                break
+        
+        if image_id is None:
+            print(f"  ⚠️  Warning: Image {first_image_name} not found in COLMAP reconstruction")
+            return None
+            
+        # Extract visible sparse 3D points for this image
+        visible_point3d_ids = []
+        
+        for point2d in colmap_image.points2D:
+            if point2d.point3D_id != -1:  # Valid 3D point
+                visible_point3d_ids.append(point2d.point3D_id)
+        
+        if len(visible_point3d_ids) == 0:
+            print(f"  ⚠️  Warning: No visible 3D points found for image {first_image_name}")
+            return None
+            
+        print(f"  📊 Found {len(visible_point3d_ids)} visible sparse 3D points")
+        
+        # Get 3D coordinates of visible points
+        sparse_points_3d = []
+        for point3d_id in visible_point3d_ids:
+            if point3d_id in colmap_reconstruction.points3D:
+                point3d = colmap_reconstruction.points3D[point3d_id]
+                sparse_points_3d.append(point3d.xyz)
+        
+        sparse_points_3d = np.array(sparse_points_3d)  # [N, 3]
+        
+        # Project 3D sparse points onto depth map using camera extrinsics and intrinsics
+        H, W = first_depth_map.shape
+        
+        # Transform 3D points to camera coordinate system using extrinsics
+        # Extrinsic matrix is [R|t] where camera_point = R * world_point + t
+        R = first_extrinsic[:3, :3]  # [3, 3]
+        t = first_extrinsic[:3, 3]   # [3]
+        
+        # Convert world points to camera coordinates
+        camera_points_3d = (R @ sparse_points_3d.T).T + t[None, :]  # [N, 3]
+        
+        # Project to image plane using intrinsics
+        # P = K * [X/Z, Y/Z, 1]^T where [X, Y, Z] are camera coordinates
+        valid_depth_mask = camera_points_3d[:, 2] > 0  # Only points in front of camera
+        if not np.any(valid_depth_mask):
+            print(f"  ⚠️  Warning: No sparse points are in front of the camera")
+            return None
+            
+        # Filter to only valid points
+        valid_camera_points = camera_points_3d[valid_depth_mask]
+        valid_sparse_points_3d = sparse_points_3d[valid_depth_mask]
+        
+        # Project using intrinsics: [u, v] = K @ [X/Z, Y/Z, 1]
+        projected_homogeneous = first_intrinsic @ (valid_camera_points / valid_camera_points[:, 2:3]).T  # [3, N]
+        projected_2d = projected_homogeneous[:2].T  # [N, 2] -> [u, v]
+        
+        # Clamp coordinates to valid depth map bounds
+        projected_2d[:, 0] = np.clip(projected_2d[:, 0], 0, W-1)  # u (x)
+        projected_2d[:, 1] = np.clip(projected_2d[:, 1], 0, H-1)  # v (y)
+        
+        # Sample depths from scaled depth map at projected locations
+        sampled_depths = []
+        final_valid_indices = []
+        
+        for i, (u, v) in enumerate(projected_2d):
+            u_int, v_int = int(round(u)), int(round(v))
+            if 0 <= u_int < W and 0 <= v_int < H:
+                depth_value = first_depth_map[v_int, u_int]  # Note: depth map is [y, x]
+                if depth_value > 0:  # Valid depth
+                    sampled_depths.append(depth_value)
+                    final_valid_indices.append(i)
+        
+        if len(sampled_depths) == 0:
+            print(f"  ⚠️  Warning: No valid depth samples found")
+            return None
+            
+        sampled_depths = np.array(sampled_depths)
+        final_valid_sparse_points = valid_sparse_points_3d[final_valid_indices]
+        final_valid_camera_points = valid_camera_points[final_valid_indices]
+        
+        print(f"  📏 Successfully sampled {len(sampled_depths)} valid depth points")
+        
+        # Use the Z coordinate (depth) from camera coordinate system for sparse points
+        # This is more accurate than computing distance from camera center
+        actual_distances = final_valid_camera_points[:, 2]  # Z coordinate in camera space
+        
+        # Compute scale differences
+        scale_ratios = actual_distances / sampled_depths
+        avg_scale_ratio = np.mean(scale_ratios)
+        scale_std = np.std(scale_ratios)
+        
+        print(f"\n  📊 Dense vs Sparse Point Cloud Analysis:")
+        print(f"     Average scale ratio (sparse/dense): {avg_scale_ratio:.6f}")
+        print(f"     Scale ratio std deviation: {scale_std:.6f}")
+        print(f"     Min scale ratio: {np.min(scale_ratios):.6f}")
+        print(f"     Max scale ratio: {np.max(scale_ratios):.6f}")
+        
+        # Compute robust linear transform: sparse_depth = a * dense_depth + b
+        # Use robust fitting to handle outliers
+        try:
+            from sklearn.linear_model import RANSACRegressor, LinearRegression
+            use_ransac = True
+        except ImportError:
+            print("  ⚠️  sklearn not available, using simple linear regression")
+            use_ransac = False
+        
+        # Prepare data for linear regression: X = dense_depths, y = sparse_depths
+        X = sampled_depths.reshape(-1, 1)  # [N, 1]
+        y = actual_distances  # [N]
+        
+        if use_ransac:
+            # Use RANSAC for robust fitting
+            ransac = RANSACRegressor(
+                LinearRegression(),
+                min_samples=max(2, int(0.5 * len(X))),  # Use at least half the points
+                residual_threshold=0.1,  # Threshold for outliers
+                random_state=42
+            )
+            ransac.fit(X, y)
+            
+            # Get transform parameters
+            a = ransac.estimator_.coef_[0]  # slope
+            b = ransac.estimator_.intercept_  # intercept
+            inlier_mask = ransac.inlier_mask_
+            n_inliers = np.sum(inlier_mask)
+            
+            # Compute R-squared on inliers
+            y_pred = a * X.flatten() + b
+            inlier_y = y[inlier_mask]
+            inlier_pred = y_pred[inlier_mask]
+            ss_res = np.sum((inlier_y - inlier_pred) ** 2)
+            ss_tot = np.sum((inlier_y - np.mean(inlier_y)) ** 2)
+            r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+        else:
+            # Fallback to simple least squares
+            X_flat = X.flatten()
+            # Solve: y = a*x + b using least squares
+            A = np.vstack([X_flat, np.ones(len(X_flat))]).T
+            coeffs, residuals, rank, s = np.linalg.lstsq(A, y, rcond=None)
+            a, b = coeffs
+            
+            # All points are considered inliers in simple regression
+            inlier_mask = np.ones(len(y), dtype=bool)
+            n_inliers = len(y)
+            
+            # Compute R-squared
+            y_pred = a * X_flat + b
+            ss_res = np.sum((y - y_pred) ** 2)
+            ss_tot = np.sum((y - np.mean(y)) ** 2)
+            r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+        
+        print(f"\n  🔧 Robust Linear Transform (sparse = a * dense + b):")
+        print(f"     a (scale): {a:.6f}")
+        print(f"     b (offset): {b:.6f}")
+        print(f"     Inliers: {n_inliers}/{len(X)} ({100*n_inliers/len(X):.1f}%)")
+        print(f"     R-squared (inliers): {r_squared:.6f}")
+        print(f"     Transform: corrected_depth = {a:.6f} * original_depth + {b:.6f}")
+        
+        # Compute centroids for translation analysis
+        # Sample some points from dense point cloud for comparison
+        dense_points_flat = first_points_3d.reshape(-1, 3)
+        valid_dense_mask = np.all(np.isfinite(dense_points_flat), axis=1)
+        valid_dense_points = dense_points_flat[valid_dense_mask]
+        
+        if len(valid_dense_points) > 10000:
+            # Subsample for efficiency
+            indices = np.random.choice(len(valid_dense_points), 10000, replace=False)
+            valid_dense_points = valid_dense_points[indices]
+        
+        # Compute centroids
+        sparse_centroid = np.mean(final_valid_sparse_points, axis=0)
+        dense_centroid = np.mean(valid_dense_points, axis=0)
+        translation_offset = sparse_centroid - dense_centroid
+        
+        print(f"\n  🌐 3D Translation Analysis:")
+        print(f"     Sparse centroid: [{sparse_centroid[0]:.3f}, {sparse_centroid[1]:.3f}, {sparse_centroid[2]:.3f}]")
+        print(f"     Dense centroid:  [{dense_centroid[0]:.3f}, {dense_centroid[1]:.3f}, {dense_centroid[2]:.3f}]")
+        print(f"     Translation offset: [{translation_offset[0]:.3f}, {translation_offset[1]:.3f}, {translation_offset[2]:.3f}]")
+        print(f"     Translation magnitude: {np.linalg.norm(translation_offset):.3f}")
+        
+        return {
+            'avg_scale_ratio': avg_scale_ratio,
+            'scale_std': scale_std,
+            'scale_ratios': scale_ratios,
+            'translation_offset': translation_offset,
+            'sparse_centroid': sparse_centroid,
+            'dense_centroid': dense_centroid,
+            'num_compared_points': len(sampled_depths),
+            'sparse_points_3d': final_valid_sparse_points,
+            'sampled_depths': sampled_depths,
+            'actual_distances': actual_distances,
+            'linear_transform': {
+                'a': a,
+                'b': b,
+                'r_squared': r_squared,
+                'n_inliers': n_inliers,
+                'inlier_ratio': n_inliers / len(X)
+            }
+        }
+        
+    except Exception as e:
+        print(f"  ❌ Error in dense vs sparse comparison: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 
 def compute_pointclouds_with_reference_extrinsics(depth_maps, intrinsics, reference_extrinsics):
     """
@@ -805,6 +1055,118 @@ def process_images_for_pointclouds(model, image_paths, dtype, args, cached_calib
         
         print(f"  ✅ Point clouds computed with correct scale and reference poses")
         
+        # Compare dense point cloud with sparse SFM points for analysis
+        comparison_result = compare_dense_vs_sparse_pointclouds(
+            points_3d_batch, scaled_depth_maps, intrinsic_batch, 
+            reference_extrinsics, cached_calibration_data['reconstruction'], batch_image_names, 
+            vggt_model_resolution
+        )
+        
+        # Apply linear transform to depth maps if comparison was successful
+        corrected_points_3d_batch = None
+        if comparison_result is not None and 'linear_transform' in comparison_result:
+            transform = comparison_result['linear_transform']
+            a, b = transform['a'], transform['b']
+            
+            print(f"\n  🔧 Applying linear transform to depth maps...")
+            print(f"     Transform: corrected_depth = {a:.6f} * original_depth + {b:.6f}")
+            
+            # Apply linear transform: corrected_depth = a * original_depth + b
+            corrected_scaled_depth_maps = a * scaled_depth_maps + b
+            
+            # Ensure positive depths only
+            corrected_scaled_depth_maps = np.maximum(corrected_scaled_depth_maps, 0.001)
+            
+            # Compute corrected point clouds using transformed depth maps
+            if args.save_first_only:
+                first_corrected_depth = corrected_scaled_depth_maps[0:1]  # [1, H, W]
+                first_intrinsic_only = intrinsic_batch[0:1]  # [1, 3, 3]
+                first_reference_extrinsic = reference_extrinsics[0:1]  # [1, 3, 4]
+                corrected_points_3d_batch = compute_pointclouds_with_reference_extrinsics(
+                    first_corrected_depth, first_intrinsic_only, first_reference_extrinsic
+                )
+            else:
+                corrected_points_3d_batch = compute_pointclouds_with_reference_extrinsics(
+                    corrected_scaled_depth_maps, intrinsic_batch, reference_extrinsics
+                )
+            
+            print(f"  ✅ Corrected point clouds computed using linear transform")
+            
+            # Save corrected point cloud
+            corrected_dir = os.path.join(batch_dir, "corrected")
+            os.makedirs(corrected_dir, exist_ok=True)
+            
+            if not args.save_first_only:
+                # Save combined corrected point cloud
+                batch_corrected_points_flat = corrected_points_3d_batch.reshape(-1, 3)
+                batch_conf_flat = depth_conf_batch.flatten()
+                
+                # Load and process original images for color sampling
+                batch_colors_list = []
+                for i, image_path in enumerate(batch_paths):
+                    if os.path.exists(image_path):
+                        image = Image.open(image_path).convert('RGB')
+                        depth_h, depth_w = depth_conf_batch[i].shape
+                        image_resized = image.resize((depth_w, depth_h), Image.Resampling.LANCZOS)
+                        image_array = np.array(image_resized)
+                        batch_colors_list.append(image_array)
+                    else:
+                        depth_h, depth_w = depth_conf_batch[i].shape
+                        gray_image = np.full((depth_h, depth_w, 3), 128, dtype=np.uint8)
+                        batch_colors_list.append(gray_image)
+                
+                batch_colors = np.stack(batch_colors_list, axis=0)  # [B, H, W, 3]
+                batch_colors_flat = batch_colors.reshape(-1, 3)
+                
+                # Apply confidence filtering
+                conf_mask = batch_conf_flat > args.conf_threshold
+                corrected_points_filtered = batch_corrected_points_flat[conf_mask]
+                corrected_colors_filtered = batch_colors_flat[conf_mask]
+                
+                print(f"  💾 Saving corrected point cloud with {len(corrected_points_filtered)} points...")
+                corrected_ply_path = os.path.join(corrected_dir, "corrected_batch.ply")
+                corrected_point_cloud = trimesh.PointCloud(vertices=corrected_points_filtered, colors=corrected_colors_filtered)
+                corrected_point_cloud.export(corrected_ply_path)
+                
+            else:
+                # Save first image corrected point cloud only
+                first_corrected_points = corrected_points_3d_batch[0].reshape(-1, 3)
+                first_conf = depth_conf_batch[0].flatten()
+                
+                # Load first image for colors
+                first_image_path = batch_paths[0]
+                if os.path.exists(first_image_path):
+                    image = Image.open(first_image_path).convert('RGB')
+                    depth_h, depth_w = depth_conf_batch[0].shape
+                    image_resized = image.resize((depth_w, depth_h), Image.Resampling.LANCZOS)
+                    first_colors = np.array(image_resized).reshape(-1, 3)
+                else:
+                    first_colors = np.full((len(first_corrected_points), 3), 128, dtype=np.uint8)
+                
+                # Apply confidence filtering
+                conf_mask = first_conf > args.conf_threshold
+                corrected_points_filtered = first_corrected_points[conf_mask]
+                corrected_colors_filtered = first_colors[conf_mask]
+                
+                print(f"  💾 Saving corrected point cloud (first image) with {len(corrected_points_filtered)} points...")
+                corrected_ply_path = os.path.join(corrected_dir, "corrected_batch.ply")
+                corrected_point_cloud = trimesh.PointCloud(vertices=corrected_points_filtered, colors=corrected_colors_filtered)
+                corrected_point_cloud.export(corrected_ply_path)
+            
+            # Save transform parameters
+            transform_json_path = os.path.join(corrected_dir, "linear_transform.json")
+            with open(transform_json_path, 'w') as f:
+                json.dump({
+                    'linear_transform': transform,
+                    'comparison_stats': {
+                        'avg_scale_ratio': comparison_result['avg_scale_ratio'],
+                        'scale_std': comparison_result['scale_std'],
+                        'num_compared_points': comparison_result['num_compared_points'],
+                        'translation_magnitude': float(np.linalg.norm(comparison_result['translation_offset']))
+                    }
+                }, f, indent=2)
+            print(f"  📄 Saved transform parameters to {transform_json_path}")
+        
         # Create transformed directory 
         os.makedirs(transformed_dir, exist_ok=True)
 
@@ -949,6 +1311,10 @@ def process_images_for_pointclouds(model, image_paths, dtype, args, cached_calib
     print(f"\n🔗 Combining all transformed point clouds...")
     combine_all_transformed_pointclouds(args.output_dir, num_batches)
     
+    # Combine all corrected point clouds into a single global corrected point cloud
+    print(f"\n🔗 Combining all corrected point clouds...")
+    combine_all_corrected_pointclouds(args.output_dir, num_batches)
+    
     # Save overall processing metadata
     save_processing_metadata(args, image_paths, args.output_dir)
 
@@ -1027,6 +1393,83 @@ def combine_all_transformed_pointclouds(output_dir, num_batches):
         
     except Exception as e:
         print(f"  ❌ Error combining point clouds: {e}")
+        return False
+
+
+def combine_all_corrected_pointclouds(output_dir, num_batches):
+    """
+    Combine all corrected/corrected_batch.ply files from all batches into a single global corrected point cloud.
+    
+    Args:
+        output_dir: Main output directory containing batch subdirectories
+        num_batches: Number of batches processed
+    """
+    try:
+        all_vertices = []
+        all_colors = []
+        successful_batches = 0
+        total_points = 0
+        
+        print(f"  🔍 Searching for corrected point clouds in {num_batches} batches...")
+        
+        # Collect all corrected point clouds
+        for batch_idx in range(num_batches):
+            batch_dir = os.path.join(output_dir, f"batch_{batch_idx:03d}")
+            corrected_path = os.path.join(batch_dir, "corrected", "corrected_batch.ply")
+            
+            if os.path.exists(corrected_path):
+                try:
+                    # Load the corrected point cloud
+                    point_cloud = trimesh.load(corrected_path)
+                    
+                    if hasattr(point_cloud, 'vertices') and len(point_cloud.vertices) > 0:
+                        vertices = point_cloud.vertices
+                        colors = point_cloud.colors if hasattr(point_cloud, 'colors') else None
+                        
+                        all_vertices.append(vertices)
+                        if colors is not None:
+                            all_colors.append(colors)
+                        else:
+                            # Create default gray colors if colors are missing
+                            gray_colors = np.full((len(vertices), 3), 128, dtype=np.uint8)
+                            all_colors.append(gray_colors)
+                        
+                        successful_batches += 1
+                        total_points += len(vertices)
+                        print(f"    ✅ batch_{batch_idx:03d}: {len(vertices)} points")
+                    else:
+                        print(f"    ⚠️  batch_{batch_idx:03d}: No vertices found")
+                        
+                except Exception as e:
+                    print(f"    ❌ batch_{batch_idx:03d}: Failed to load - {e}")
+            else:
+                print(f"    ⚠️  batch_{batch_idx:03d}: Corrected point cloud not found")
+        
+        if successful_batches == 0:
+            print(f"  ❌ No corrected point clouds found to combine")
+            return False
+        
+        # Combine all vertices and colors
+        print(f"  🔗 Combining {successful_batches} corrected point clouds...")
+        combined_vertices = np.vstack(all_vertices)
+        combined_colors = np.vstack(all_colors)
+        
+        # Create and save the combined corrected point cloud
+        global_corrected_pointcloud_path = os.path.join(output_dir, "corrected_pointcloud.ply")
+        combined_pointcloud = trimesh.PointCloud(vertices=combined_vertices, colors=combined_colors)
+        combined_pointcloud.export(global_corrected_pointcloud_path)
+        
+        print(f"  ✅ Successfully combined {successful_batches}/{num_batches} corrected batches")
+        print(f"     Total points: {len(combined_vertices):,}")
+        print(f"     Saved to: {global_corrected_pointcloud_path}")
+        print(f"     Point range: X[{combined_vertices[:,0].min():.3f}, {combined_vertices[:,0].max():.3f}], "
+              f"Y[{combined_vertices[:,1].min():.3f}, {combined_vertices[:,1].max():.3f}], "
+              f"Z[{combined_vertices[:,2].min():.3f}, {combined_vertices[:,2].max():.3f}]")
+        
+        return True
+        
+    except Exception as e:
+        print(f"  ❌ Error combining corrected point clouds: {e}")
         return False
 
 
