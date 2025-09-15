@@ -55,6 +55,7 @@ def parse_args():
     parser.add_argument("--ref_image_id", type=int, default=None, help="Process only a specific reference image ID (if not provided, processes all images)")
     parser.add_argument("--max_tracks_vis", type=int, default=50, help="Maximum number of tracks to show in visualization")
     parser.add_argument("--grid_spacing", type=int, default=50, help="Spacing between grid points for uniform sampling")
+    parser.add_argument("--enable_visualization", action="store_true", help="Enable track visualization")
     
     return parser.parse_args()
 
@@ -167,6 +168,7 @@ def triangulate_points(tracks: np.ndarray,
                       visibilities: np.ndarray,
                       extrinsics: List[np.ndarray],
                       intrinsics: List[np.ndarray],
+                      ref_image: np.ndarray = None,
                       min_views: int = 2) -> Tuple[np.ndarray, np.ndarray]:
     """Triangulate 3D points from 2D tracks using multiple views."""
     num_tracks, num_views = tracks.shape[:2]
@@ -230,8 +232,25 @@ def triangulate_points(tracks: np.ndarray,
                 
                 if is_valid:
                     points_3d.append(point_3d)
-                    # Use color from first visible view (placeholder)
-                    colors.append([128, 128, 128])  # Gray color
+                    
+                    # Extract color from reference image (first visible view)
+                    if ref_image is not None and len(visible_views) > 0:
+                        # Get the 2D point in the reference view (first visible view)
+                        ref_view_idx = visible_views[0]  # Use first visible view as reference
+                        ref_point_2d = points_2d[0]  # First point corresponds to first visible view
+                        
+                        # Extract color from the reference image
+                        x, y = int(ref_point_2d[0]), int(ref_point_2d[1])
+                        if 0 <= x < ref_image.shape[1] and 0 <= y < ref_image.shape[0]:
+                            # OpenCV uses BGR, convert to RGB
+                            color_bgr = ref_image[y, x]
+                            color_rgb = [int(color_bgr[2]), int(color_bgr[1]), int(color_bgr[0])]
+                        else:
+                            color_rgb = [128, 128, 128]  # Gray if out of bounds
+                    else:
+                        color_rgb = [128, 128, 128]  # Gray if no reference image
+                    
+                    colors.append(color_rgb)
                     
         except np.linalg.LinAlgError:
             continue
@@ -545,9 +564,13 @@ def triangulate_and_save_points(reconstruction: ColmapReconstruction,
         extrinsics.append(cam_from_world.matrix())
         intrinsics.append(K_orig)
     
+    # Load reference image for color extraction
+    ref_image_path = reconstruction.get_image_path(all_image_ids[0])  # Reference image is first
+    ref_image_bgr = cv2.imread(ref_image_path)
+    
     # Triangulate 3D points (require at least 3 views for better accuracy)
     points_3d, colors = triangulate_points(
-        tracks_original_res, good_visibilities, extrinsics, intrinsics, min_views=3
+        tracks_original_res, good_visibilities, extrinsics, intrinsics, ref_image_bgr, min_views=3
     )
     
     # Save point cloud
@@ -794,8 +817,9 @@ def process_reference_view(reconstruction: ColmapReconstruction,
             reconstruction, good_tracks, good_visibilities, all_image_ids, ref_image_name, original_coords, args
         )
         
-        # Visualize tracks
-        visualize_tracks(images_tensor, good_tracks, good_visibilities, all_image_ids, ref_image_name, reconstruction, original_coords, query_points, args, args.max_tracks_vis)
+        # Visualize tracks if enabled
+        if args.enable_visualization:
+            visualize_tracks(images_tensor, good_tracks, good_visibilities, all_image_ids, ref_image_name, reconstruction, original_coords, query_points, args, args.max_tracks_vis)
         
         return success
         
@@ -852,7 +876,6 @@ def main():
             )
             if not success:
                 continue
-            break
     print("Tracking completed!")
 
 
