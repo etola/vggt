@@ -512,6 +512,7 @@ def visualize_tracks(images_tensor: torch.Tensor,
                     ref_image_name: str,
                     reconstruction: ColmapReconstruction,
                     original_coords: torch.Tensor,
+                    query_points: np.ndarray,
                     args,
                     max_tracks_to_show: int = 50) -> None:
     """Visualize tracks by creating concatenated image pairs with correspondence lines."""
@@ -529,6 +530,17 @@ def visualize_tracks(images_tensor: torch.Tensor,
     ref_coords = original_coords[0].cpu().numpy()  # [x1, y1, x2, y2, orig_width, orig_height]
     ref_x1, ref_y1, ref_x2, ref_y2 = ref_coords[:4].astype(int)
     ref_image_cropped = images_np[0, ref_y1:ref_y2, ref_x1:ref_x2]
+    
+    # Mark all query points on the reference image (yellow dots)
+    ref_image_with_query_points = ref_image_cropped.copy()
+    for query_pt in query_points:
+        # Convert query point from VGGT coordinates to cropped image coordinates
+        x_cropped = int(query_pt[0] - ref_x1)
+        y_cropped = int(query_pt[1] - ref_y1)
+        
+        # Only mark if within bounds
+        if 0 <= x_cropped < ref_image_cropped.shape[1] and 0 <= y_cropped < ref_image_cropped.shape[0]:
+            cv2.circle(ref_image_with_query_points, (x_cropped, y_cropped), 1, (255, 255, 0), -1)  # Yellow circles for query points
     
     # For each paired image, create a visualization
     for i, paired_image_id in enumerate(all_image_ids[1:], 1):
@@ -552,12 +564,6 @@ def visualize_tracks(images_tensor: torch.Tensor,
         # tracks[track_idx, frame_idx, :] gives (x, y) for that track in that frame
         ref_points = tracks[both_visible, 0, :].astype(int)  # (N_visible_tracks, 2)
         paired_points = tracks[both_visible, i, :].astype(int)  # (N_visible_tracks, 2) - use frame i for paired image
-        
-        # Debug: print some track coordinates
-        print(f"DEBUG: Sample ref_points (first 3): {ref_points[:3]}")
-        print(f"DEBUG: Sample paired_points (first 3): {paired_points[:3]}")
-        print(f"DEBUG: Image shapes - ref: {ref_image_cropped.shape}, paired: {paired_image_cropped.shape}")
-        print(f"DEBUG: Original coords - ref: {ref_coords}, paired: {paired_coords}")
         
         # Filter tracks that are within the original image regions (not in padding)
         ref_in_bounds = ((ref_points[:, 0] >= ref_x1) & (ref_points[:, 0] < ref_x2) & 
@@ -583,12 +589,19 @@ def visualize_tracks(images_tensor: torch.Tensor,
         paired_points_cropped[:, 0] -= paired_x1  # Adjust x coordinates
         paired_points_cropped[:, 1] -= paired_y1  # Adjust y coordinates
         
-        print(f"DEBUG: After cropping - ref_points_cropped (first 3): {ref_points_cropped[:3]}")
-        print(f"DEBUG: After cropping - paired_points_cropped (first 3): {paired_points_cropped[:3]}")
+        # Create a fresh reference image for this paired image visualization
+        ref_image_for_this_pair = ref_image_with_query_points.copy()
         
-        # Limit number of tracks to show for better visualization
+        # Mark matched query points for THIS paired image with green circles
+        for ref_pt in ref_points_cropped:
+            x_cropped = int(ref_pt[0])
+            y_cropped = int(ref_pt[1])
+            if 0 <= x_cropped < ref_image_cropped.shape[1] and 0 <= y_cropped < ref_image_cropped.shape[0]:
+                cv2.circle(ref_image_for_this_pair, (x_cropped, y_cropped), 2, (0, 255, 0), -1)  # Green circles for matched points
+        
+        # Limit number of tracks to show correspondence lines for better visualization
         if len(ref_points_cropped) > max_tracks_to_show:
-            # Randomly sample tracks to show
+            # Randomly sample tracks to show correspondence lines
             np.random.seed(42)  # For reproducible results
             indices = np.random.choice(len(ref_points_cropped), max_tracks_to_show, replace=False)
             ref_points_cropped = ref_points_cropped[indices]
@@ -598,12 +611,12 @@ def visualize_tracks(images_tensor: torch.Tensor,
         # Resize images to same height for concatenation
         target_height = max(ref_image_cropped.shape[0], paired_image_cropped.shape[0])
         
-        # Resize reference image
-        if ref_image_cropped.shape[0] != target_height:
-            ref_image_resized = cv2.resize(ref_image_cropped, 
-                                         (int(ref_image_cropped.shape[1] * target_height / ref_image_cropped.shape[0]), target_height))
+        # Resize reference image (with query points and matches for this pair marked)
+        if ref_image_for_this_pair.shape[0] != target_height:
+            ref_image_resized = cv2.resize(ref_image_for_this_pair, 
+                                         (int(ref_image_for_this_pair.shape[1] * target_height / ref_image_for_this_pair.shape[0]), target_height))
         else:
-            ref_image_resized = ref_image_cropped.copy()
+            ref_image_resized = ref_image_for_this_pair.copy()
         
         # Resize paired image
         if paired_image_cropped.shape[0] != target_height:
@@ -626,14 +639,42 @@ def visualize_tracks(images_tensor: torch.Tensor,
         paired_points_final[:, 1] *= paired_scale_y  # Scale y coordinates
         paired_points_final[:, 0] += ref_image_resized.shape[1]  # Offset by reference image width
         
-        # Draw correspondence lines
+        # Draw correspondence lines (only for the limited set)
         for ref_pt, paired_pt in zip(ref_points_final, paired_points_final):
-            # Draw circles at feature points
-            cv2.circle(concat_image, tuple(ref_pt.astype(int)), 3, (0, 255, 0), -1)
-            cv2.circle(concat_image, tuple(paired_pt.astype(int)), 3, (0, 255, 0), -1)
-            
             # Draw line between corresponding points
             cv2.line(concat_image, tuple(ref_pt.astype(int)), tuple(paired_pt.astype(int)), (255, 0, 0), 1)
+        
+        # Draw green dots on paired image for ALL matched points (not just the limited set)
+        # Get all matched points for this pair (before limiting for lines)
+        all_ref_points_cropped = tracks[both_visible, 0, :].astype(int)  # All visible tracks
+        all_paired_points_cropped = tracks[both_visible, i, :].astype(int)  # All visible tracks
+        
+        # Filter to only tracks within original image regions
+        all_ref_in_bounds = ((all_ref_points_cropped[:, 0] >= ref_x1) & (all_ref_points_cropped[:, 0] < ref_x2) & 
+                            (all_ref_points_cropped[:, 1] >= ref_y1) & (all_ref_points_cropped[:, 1] < ref_y2))
+        all_paired_in_bounds = ((all_paired_points_cropped[:, 0] >= paired_x1) & (all_paired_points_cropped[:, 0] < paired_x2) & 
+                               (all_paired_points_cropped[:, 1] >= paired_y1) & (all_paired_points_cropped[:, 1] < paired_y2))
+        all_both_in_bounds = all_ref_in_bounds & all_paired_in_bounds
+        
+        if np.sum(all_both_in_bounds) > 0:
+            # Get all valid matched points
+            all_ref_points_valid = all_ref_points_cropped[all_both_in_bounds]
+            all_paired_points_valid = all_paired_points_cropped[all_both_in_bounds]
+            
+            # Convert to cropped coordinates
+            all_paired_points_cropped_coords = all_paired_points_valid.copy().astype(float)
+            all_paired_points_cropped_coords[:, 0] -= paired_x1
+            all_paired_points_cropped_coords[:, 1] -= paired_y1
+            
+            # Scale to match resized paired image
+            all_paired_points_final = all_paired_points_cropped_coords.copy().astype(float)
+            all_paired_points_final[:, 1] *= paired_scale_y  # Scale y coordinates
+            all_paired_points_final[:, 0] += ref_image_resized.shape[1]  # Offset by reference image width
+            
+            # Draw green dots on paired image for all matches
+            for paired_pt in all_paired_points_final:
+                cv2.circle(concat_image, tuple(paired_pt.astype(int)), 2, (0, 255, 0), -1)
+        
         
         # Save visualization
         paired_image_name = reconstruction.get_image_name(paired_image_id)
@@ -702,7 +743,7 @@ def process_reference_view(reconstruction: ColmapReconstruction,
         )
         
         # Visualize tracks
-        visualize_tracks(images_tensor, good_tracks, good_visibilities, all_image_ids, ref_image_name, reconstruction, original_coords, args, args.max_tracks_vis)
+        visualize_tracks(images_tensor, good_tracks, good_visibilities, all_image_ids, ref_image_name, reconstruction, original_coords, query_points, args, args.max_tracks_vis)
         
         return success
         
