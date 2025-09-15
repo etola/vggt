@@ -1096,10 +1096,7 @@ def main():
             print("Processing failed!")
     else:
         # Process all reference frames
-        count = 0
         for ref_image_id in tqdm(reconstruction.get_all_image_ids(), desc="Processing frames"):
-            if count > 10:
-                break
             count += 1
             success, point_id_offset = process_reference_view(
                 reconstruction, ref_image_id, model, device, dtype, args, colmap_reconstruction, point_id_offset
