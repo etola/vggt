@@ -12,6 +12,7 @@ This module contains all COLMAP-related functionality including:
 
 import numpy as np
 import random
+import os
 import pycolmap
 from typing import Optional, Dict, Set, Tuple, List
 from tqdm import tqdm
@@ -25,19 +26,30 @@ class ColmapReconstruction:
     repeated calls to pair selection and analysis functions much more efficient.
     """
     
-    def __init__(self, reconstruction_path_or_object):
+    def __init__(self, reconstruction_path_or_object, images_dir: str = None):
         """
         Initialize with either a path to reconstruction or existing reconstruction object.
         
         Args:
             reconstruction_path_or_object: Either string path to reconstruction directory
                                          or existing pycolmap.Reconstruction object
+            images_dir: Path to the images directory (if None, will be inferred from reconstruction path)
         """
         if isinstance(reconstruction_path_or_object, str):
             self.reconstruction = pycolmap.Reconstruction(reconstruction_path_or_object)
             print(f"Loaded reconstruction with {len(self.reconstruction.images)} images and {len(self.reconstruction.points3D)} 3D points")
+            
+            # Infer images directory if not provided
+            if images_dir is None:
+                # Assume images are in a sibling 'images' directory
+                reconstruction_dir = os.path.dirname(reconstruction_path_or_object)
+                images_dir = os.path.join(reconstruction_dir, "images")
         else:
             self.reconstruction = reconstruction_path_or_object
+            if images_dir is None:
+                raise ValueError("images_dir must be provided when using existing reconstruction object")
+        
+        self.images_dir = images_dir
         
         # Cached mappings (lazy loaded)
         self._image_point3D_ids: Optional[Dict[int, Set[int]]] = None
@@ -81,6 +93,7 @@ class ColmapReconstruction:
             return 0.0, 0.0
         
         image = self.reconstruction.images[image_id]
+        camera = self.reconstruction.cameras[image.camera_id]
         xs = [self._image_point3D_xy[image_id][point_id][0] for point_id in shared_points]
         ys = [self._image_point3D_xy[image_id][point_id][1] for point_id in shared_points]
         
@@ -89,8 +102,8 @@ class ColmapReconstruction:
         x_range = x_max - x_min
         y_range = y_max - y_min
         
-        x_coverage = x_range / image.camera.width
-        y_coverage = y_range / image.camera.height
+        x_coverage = x_range / camera.width
+        y_coverage = y_range / camera.height
         
         return x_coverage, y_coverage
     
@@ -120,6 +133,9 @@ class ColmapReconstruction:
         Returns:
             List of partner image IDs that satisfy parallax requirements, or [-1] if no good match found
         """
+        # Ensure mappings are built
+        self._ensure_image_point_maps()
+        
         # Find other images that share at least min_points points
         other_images = [other_image for other_image in self.reconstruction.images.values() 
                        if other_image.image_id != image_id]
@@ -298,13 +314,19 @@ class ColmapReconstruction:
         """Get image filename by ID."""
         return self.get_image(image_id).name
     
+    def get_image_path(self, image_id: int) -> str:
+        """Get full path to image file by ID."""
+        image_name = self.get_image_name(image_id)
+        return os.path.join(self.images_dir, image_name)
+    
     def get_image_camera(self, image_id: int):
         """Get camera object for an image."""
-        return self.get_image(image_id).camera
+        image = self.get_image(image_id)
+        return self.reconstruction.cameras[image.camera_id]
     
     def get_image_cam_from_world(self, image_id: int):
         """Get camera pose (cam_from_world) for an image."""
-        return self.get_image(image_id).cam_from_world()
+        return self.get_image(image_id).cam_from_world
     
     def get_all_image_ids(self) -> List[int]:
         """Get list of all image IDs in the reconstruction."""
@@ -492,11 +514,11 @@ class MatchCandidate:
         self.y_coverage = 0
 
 
-def load_reconstruction(reconstruction_path):
+def load_reconstruction(reconstruction_path, images_dir=None):
     """
     Load COLMAP reconstruction and return ColmapReconstruction wrapper.
     """
     try:
-        return ColmapReconstruction(reconstruction_path)
+        return ColmapReconstruction(reconstruction_path, images_dir)
     except Exception as e:
         raise ValueError(f"Failed to load COLMAP reconstruction from {reconstruction_path}: {e}") 
