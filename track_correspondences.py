@@ -169,11 +169,12 @@ def triangulate_points(tracks: np.ndarray,
                       extrinsics: List[np.ndarray],
                       intrinsics: List[np.ndarray],
                       ref_image: np.ndarray = None,
-                      min_views: int = 2) -> Tuple[np.ndarray, np.ndarray]:
+                      min_views: int = 2) -> Tuple[np.ndarray, np.ndarray, List[List[int]]]:
     """Triangulate 3D points from 2D tracks using multiple views."""
     num_tracks, num_views = tracks.shape[:2]
     points_3d = []
     colors = []
+    visibility_info = []  # List of visible image IDs for each 3D point
     
     for track_idx in range(num_tracks):
         # Get visible views for this track
@@ -251,14 +252,15 @@ def triangulate_points(tracks: np.ndarray,
                         color_rgb = [128, 128, 128]  # Gray if no reference image
                     
                     colors.append(color_rgb)
+                    visibility_info.append(visible_views.tolist())
                     
         except np.linalg.LinAlgError:
             continue
     
     if len(points_3d) == 0:
-        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3)
+        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), []
     
-    return np.array(points_3d), np.array(colors)
+    return np.array(points_3d), np.array(colors), visibility_info
 
 
 def save_pointcloud(points_3d: np.ndarray, colors: np.ndarray, filename: str):
@@ -273,6 +275,150 @@ def save_pointcloud(points_3d: np.ndarray, colors: np.ndarray, filename: str):
     # Save as PLY
     point_cloud.export(filename)
     print(f"Saved {len(points_3d)} points to {filename}")
+
+
+def create_colmap_reconstruction_structure(original_reconstruction: ColmapReconstruction) -> 'pycolmap.Reconstruction':
+    """Create a new empty COLMAP reconstruction with the same cameras and images as the original."""
+    import pycolmap
+    
+    # Create new reconstruction
+    new_reconstruction = pycolmap.Reconstruction()
+    
+    # Copy cameras
+    for camera_id, camera in original_reconstruction.reconstruction.cameras.items():
+        new_reconstruction.add_camera(camera)
+    
+    # Copy images (without 2D points for now)
+    for image_id, image in original_reconstruction.reconstruction.images.items():
+        new_reconstruction.add_image(image)
+    
+    return new_reconstruction
+
+
+def save_tracking_data_for_colmap(points_3d: np.ndarray,
+                                 visibility_info: List[List[int]],
+                                 tracks_original_res: np.ndarray,
+                                 all_image_ids: List[int],
+                                 colors: np.ndarray,
+                                 filename: str,
+                                 point_id_offset: int = 0) -> int:
+    """Save tracking data in a format that can be easily converted to COLMAP reconstruction."""
+    import json
+    
+    tracking_data = {
+        'points_3d': points_3d.tolist(),
+        'visibility_info': visibility_info,
+        'tracks_2d': tracks_original_res.tolist(),
+        'image_ids': all_image_ids,
+        'colors': colors.tolist(),
+        'point_id_offset': point_id_offset
+    }
+    
+    with open(filename, 'w') as f:
+        json.dump(tracking_data, f, indent=2)
+    
+    print(f"Saved tracking data for {len(points_3d)} points to {filename}")
+    return point_id_offset + len(points_3d)
+
+
+def create_colmap_binary_files_from_tracking_data(original_reconstruction: ColmapReconstruction, 
+                                                 output_dir: str):
+    """Create COLMAP binary files from all tracking data JSON files."""
+    import json
+    import glob
+    import pycolmap
+    
+    # Look for tracking data files in the tracks subdirectory
+    tracks_dir = os.path.join(output_dir, "tracks")
+    if not os.path.exists(tracks_dir):
+        print("No tracks directory found")
+        return
+        
+    json_files = glob.glob(os.path.join(tracks_dir, "*_tracking_data.json"))
+    
+    if not json_files:
+        print("No tracking data files found in tracks directory")
+        return
+    
+    print(f"Found {len(json_files)} tracking data files")
+    
+    # Create output directory for COLMAP binary files
+    colmap_binary_dir = os.path.join(output_dir, "tracking_colmap")
+    os.makedirs(colmap_binary_dir, exist_ok=True)
+    
+    # Create a new reconstruction object
+    new_reconstruction = pycolmap.Reconstruction()
+    
+    # Copy cameras from original reconstruction
+    for camera_id, camera in original_reconstruction.reconstruction.cameras.items():
+        new_reconstruction.add_camera(camera)
+    
+    # Copy images from original reconstruction
+    for image_id, image in original_reconstruction.reconstruction.images.items():
+        new_reconstruction.add_image(image)
+    
+    # Process tracking data and add 3D points to reconstruction
+    point_id_offset = 0
+    
+    for json_file in json_files:
+        print(f"Processing {os.path.basename(json_file)}...")
+        
+        with open(json_file, 'r') as f:
+            tracking_data = json.load(f)
+        
+        points_3d = np.array(tracking_data['points_3d'])
+        visibility_info = tracking_data['visibility_info']
+        tracks_2d = np.array(tracking_data['tracks_2d'])
+        image_ids = tracking_data['image_ids']
+        colors = np.array(tracking_data['colors'])
+        
+        # Process each 3D point
+        for i, (point_3d, visible_views, color) in enumerate(zip(points_3d, visibility_info, colors)):
+            current_point_id = point_id_offset + i
+            
+            # Create track for this 3D point
+            track = pycolmap.Track()
+            
+            # Add 2D observations to images
+            for view_idx in visible_views:
+                image_id = image_ids[view_idx]
+                x_2d, y_2d = tracks_2d[i, view_idx, 0], tracks_2d[i, view_idx, 1]
+                
+                # Create Point2D object without point3D_id initially
+                point2d = pycolmap.Point2D(xy=(float(x_2d), float(y_2d)))
+                
+                # Add to image's points2D list
+                image = new_reconstruction.images[image_id]
+                point2d_idx = len(image.points2D)
+                image.points2D.append(point2d)
+                
+                # Add to track
+                track.add_element(image_id, point2d_idx)
+            
+            # Add the 3D point to reconstruction using the correct method signature
+            new_reconstruction.add_point3D(point_3d, track, color)
+        
+        point_id_offset += len(points_3d)
+    
+    # Save reconstruction in binary format
+    new_reconstruction.write(colmap_binary_dir)
+    
+    print(f"Created COLMAP binary files in {colmap_binary_dir}")
+    print(f"  - cameras.bin: {len(new_reconstruction.cameras)} cameras")
+    print(f"  - images.bin: {len(new_reconstruction.images)} images")
+    print(f"  - points3D.bin: {len(new_reconstruction.points3D)} 3D points")
+
+
+def save_colmap_reconstruction(reconstruction: 'pycolmap.Reconstruction', output_dir: str):
+    """Save COLMAP reconstruction as binary files."""
+    import pycolmap
+    
+    # Save the three main files
+    reconstruction.write_binary(output_dir)
+    print(f"Saved COLMAP reconstruction to {output_dir}")
+    print(f"  - Images: {len(reconstruction.images)}")
+    print(f"  - Cameras: {len(reconstruction.cameras)}")
+    print(f"  - 3D Points: {len(reconstruction.points3D)}")
 
 
 def get_paired_image_ids(reconstruction: ColmapReconstruction, ref_image_id: int, args) -> List[int]:
@@ -500,11 +646,13 @@ def triangulate_and_save_points(reconstruction: ColmapReconstruction,
                                all_image_ids: List[int],
                                ref_image_name: str,
                                original_coords: torch.Tensor,
-                               args) -> bool:
-    """Triangulate 3D points and save them as PLY file."""
+                               args,
+                               colmap_reconstruction: 'pycolmap.Reconstruction' = None,
+                               point_id_offset: int = 0) -> Tuple[bool, int]:
+    """Triangulate 3D points and save them as PLY file and/or add to COLMAP reconstruction."""
     if len(good_tracks) == 0:
         print(f"No good tracks found for {ref_image_name}")
-        return False
+        return False, point_id_offset
     
     print(f"Found {len(good_tracks)} good tracks for {ref_image_name}")
     
@@ -569,15 +717,30 @@ def triangulate_and_save_points(reconstruction: ColmapReconstruction,
     ref_image_bgr = cv2.imread(ref_image_path)
     
     # Triangulate 3D points (require at least 3 views for better accuracy)
-    points_3d, colors = triangulate_points(
+    points_3d, colors, visibility_info = triangulate_points(
         tracks_original_res, good_visibilities, extrinsics, intrinsics, ref_image_bgr, min_views=3
     )
     
-    # Save point cloud
-    output_filename = os.path.join(args.scene_folder, args.output_folder, f"{os.path.splitext(ref_image_name)[0]}_tracks.ply")
+    # Create organized output directories
+    point_clouds_dir = os.path.join(args.scene_folder, args.output_folder, "point_clouds")
+    tracks_dir = os.path.join(args.scene_folder, args.output_folder, "tracks")
+    os.makedirs(point_clouds_dir, exist_ok=True)
+    os.makedirs(tracks_dir, exist_ok=True)
+    
+    # Save point cloud in point_clouds folder
+    output_filename = os.path.join(point_clouds_dir, f"{os.path.splitext(ref_image_name)[0]}_tracks.ply")
     save_pointcloud(points_3d, colors, output_filename)
     
-    return True
+    # Save tracking data for COLMAP reconstruction if provided
+    if colmap_reconstruction is not None:
+        tracking_filename = os.path.join(tracks_dir, f"{os.path.splitext(ref_image_name)[0]}_tracking_data.json")
+        new_point_id_offset = save_tracking_data_for_colmap(
+            points_3d, visibility_info, tracks_original_res, all_image_ids, colors, tracking_filename, point_id_offset
+        )
+        print(f"Saved tracking data for {len(points_3d)} points (IDs {point_id_offset}-{new_point_id_offset-1})")
+        return True, new_point_id_offset
+    else:
+        return True, point_id_offset
 
 
 def visualize_tracks(images_tensor: torch.Tensor,
@@ -591,7 +754,7 @@ def visualize_tracks(images_tensor: torch.Tensor,
                     args,
                     max_tracks_to_show: int = 50) -> None:
     """Visualize tracks by creating concatenated image pairs with correspondence lines."""
-    output_dir = os.path.join(args.scene_folder, args.output_folder, "track_visualizations")
+    output_dir = os.path.join(args.scene_folder, args.output_folder, "visualizations")
     os.makedirs(output_dir, exist_ok=True)
     
     # Convert tensor images to numpy arrays (already resized for VGGT)
@@ -765,7 +928,9 @@ def process_reference_view(reconstruction: ColmapReconstruction,
                           model, 
                           device: str, 
                           dtype: torch.dtype, 
-                          args) -> bool:
+                          args,
+                          colmap_reconstruction: 'pycolmap.Reconstruction' = None,
+                          point_id_offset: int = 0) -> Tuple[bool, int]:
     """
     Process tracking for a specific reference view.
     
@@ -813,24 +978,30 @@ def process_reference_view(reconstruction: ColmapReconstruction,
         )
         
         # Triangulate and save points
-        success = triangulate_and_save_points(
-            reconstruction, good_tracks, good_visibilities, all_image_ids, ref_image_name, original_coords, args
+        success, new_point_id_offset = triangulate_and_save_points(
+            reconstruction, good_tracks, good_visibilities, all_image_ids, ref_image_name, original_coords, args,
+            colmap_reconstruction, point_id_offset
         )
         
         # Visualize tracks if enabled
         if args.enable_visualization:
             visualize_tracks(images_tensor, good_tracks, good_visibilities, all_image_ids, ref_image_name, reconstruction, original_coords, query_points, args, args.max_tracks_vis)
         
-        return success
+        return success, new_point_id_offset
         
     except Exception as e:
         print(f"Error processing reference view {ref_image_id}: {e}")
-        return False
+        return False, point_id_offset
 
 
 def merge_point_clouds(output_dir: str, merged_filename: str = "merged_tracks.ply"):
     """Merge all individual PLY files into a single point cloud."""
-    ply_files = [f for f in os.listdir(output_dir) if f.endswith('_tracks.ply')]
+    point_clouds_dir = os.path.join(output_dir, "point_clouds")
+    if not os.path.exists(point_clouds_dir):
+        print("No point_clouds directory found")
+        return
+        
+    ply_files = [f for f in os.listdir(point_clouds_dir) if f.endswith('_tracks.ply')]
     
     if not ply_files:
         print("No PLY files found to merge")
@@ -842,7 +1013,7 @@ def merge_point_clouds(output_dir: str, merged_filename: str = "merged_tracks.pl
     all_colors = []
     
     for ply_file in ply_files:
-        ply_path = os.path.join(output_dir, ply_file)
+        ply_path = os.path.join(point_clouds_dir, ply_file)
         print(f"Loading {ply_file}...")
         
         # Read PLY file
@@ -904,6 +1075,10 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     print(f"Output directory: {output_dir}")
     
+    # Create COLMAP reconstruction structure for storing all points
+    colmap_reconstruction = create_colmap_reconstruction_structure(reconstruction)
+    point_id_offset = 0
+    
     # Process reference frame(s)
     if args.ref_image_id is not None:
         # Process only the specified image ID
@@ -912,8 +1087,8 @@ def main():
             return
         
         print(f"Processing specific image ID: {args.ref_image_id}")
-        success = process_reference_view(
-            reconstruction, args.ref_image_id, model, device, dtype, args
+        success, point_id_offset = process_reference_view(
+            reconstruction, args.ref_image_id, model, device, dtype, args, colmap_reconstruction, point_id_offset
         )
         if success:
             print("Processing completed successfully!")
@@ -921,16 +1096,23 @@ def main():
             print("Processing failed!")
     else:
         # Process all reference frames
+        count = 0
         for ref_image_id in tqdm(reconstruction.get_all_image_ids(), desc="Processing frames"):
-            success = process_reference_view(
-                reconstruction, ref_image_id, model, device, dtype, args
+            if count > 10:
+                break
+            count += 1
+            success, point_id_offset = process_reference_view(
+                reconstruction, ref_image_id, model, device, dtype, args, colmap_reconstruction, point_id_offset
             )
             if not success:
                 continue
-        
-        # Merge all point clouds into a single file
-        print("Merging point clouds...")
-        merge_point_clouds(output_dir)
+
+    # Merge all point clouds into a single file
+    print("Merging point clouds...")
+    merge_point_clouds(output_dir)
+    
+    # Create COLMAP binary files from tracking data
+    create_colmap_binary_files_from_tracking_data(reconstruction, output_dir)
     
     print("Tracking completed!")
 
