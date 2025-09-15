@@ -263,9 +263,9 @@ def get_paired_image_ids(reconstruction: ColmapReconstruction, ref_image_id: int
         parallax_sample_size=100
     )
     
-    # Filter out -1 (no match found) and take only the first partner for debugging
+    # Filter out -1 (no match found) and take up to N=8 partners
     valid_partners = [pid for pid in paired_ids if pid != -1]
-    return valid_partners[:1]  # Only take the first paired image for debugging
+    return valid_partners[:args.pairs_per_image]  # Take up to pairs_per_image (default 8)
 
 
 def prepare_image_batch(reconstruction: ColmapReconstruction, 
@@ -451,20 +451,43 @@ def triangulate_and_save_points(reconstruction: ColmapReconstruction,
         tracks_original_res[:, frame_idx, 0] = (tracks_original_res[:, frame_idx, 0] - x1) * scale_x
         tracks_original_res[:, frame_idx, 1] = (tracks_original_res[:, frame_idx, 1] - y1) * scale_y
     
+    # Filter out tracks that fall in padded regions (same as visualization)
+    valid_tracks_mask = np.ones(len(tracks_original_res), dtype=bool)
+    
+    for frame_idx in range(tracks_original_res.shape[1]):
+        frame_coords = original_coords[frame_idx].cpu().numpy()  # [6] - coordinate info for this frame
+        x1, y1, x2, y2, orig_width, orig_height = frame_coords
+        
+        # Check if tracks are within original image bounds (not in padding)
+        frame_tracks = tracks_original_res[:, frame_idx, :]  # (N_tracks, 2)
+        in_bounds = ((frame_tracks[:, 0] >= 0) & (frame_tracks[:, 0] < orig_width) & 
+                    (frame_tracks[:, 1] >= 0) & (frame_tracks[:, 1] < orig_height))
+        
+        # Only keep tracks that are in bounds for this frame
+        valid_tracks_mask &= in_bounds
+    
+    # Filter tracks and visibilities to only include valid ones
+    if np.sum(valid_tracks_mask) == 0:
+        print(f"No tracks within original image regions for triangulation")
+        return False
+    
+    tracks_original_res = tracks_original_res[valid_tracks_mask]
+    good_visibilities = good_visibilities[valid_tracks_mask]
+    
+    print(f"Filtered to {len(tracks_original_res)} tracks within original image regions for triangulation")
+    
     # Compute scaled camera parameters for all views
     extrinsics = []
     intrinsics = []
     
     for img_id in all_image_ids:
-        # Get original image size from COLMAP
-        camera = reconstruction.get_image_camera(img_id)
-        orig_size = (camera.height, camera.width)  # (height, width)
+        # Get original camera parameters (since tracks are already scaled back to original resolution)
+        K_orig = reconstruction.get_camera_calibration_matrix(img_id)
+        cam_from_world = reconstruction.get_image_cam_from_world(img_id)
         
-        ext, int_mat = compute_scaled_camera_parameters(
-            reconstruction, img_id, orig_size, args.vggt_resolution
-        )
-        extrinsics.append(ext)
-        intrinsics.append(int_mat)
+        # Use original intrinsics and extrinsics for triangulation
+        extrinsics.append(cam_from_world.matrix())
+        intrinsics.append(K_orig)
     
     # Triangulate 3D points
     points_3d, colors = triangulate_points(
