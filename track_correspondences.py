@@ -828,6 +828,57 @@ def process_reference_view(reconstruction: ColmapReconstruction,
         return False
 
 
+def merge_point_clouds(output_dir: str, merged_filename: str = "merged_tracks.ply"):
+    """Merge all individual PLY files into a single point cloud."""
+    ply_files = [f for f in os.listdir(output_dir) if f.endswith('_tracks.ply')]
+    
+    if not ply_files:
+        print("No PLY files found to merge")
+        return
+    
+    print(f"Found {len(ply_files)} PLY files to merge")
+    
+    all_points = []
+    all_colors = []
+    
+    for ply_file in ply_files:
+        ply_path = os.path.join(output_dir, ply_file)
+        print(f"Loading {ply_file}...")
+        
+        # Read PLY file
+        points, colors = read_ply_file(ply_path)
+        if len(points) > 0:
+            all_points.append(points)
+            all_colors.append(colors)
+    
+    if not all_points:
+        print("No valid points found in any PLY files")
+        return
+    
+    # Concatenate all points and colors
+    merged_points = np.vstack(all_points)
+    merged_colors = np.vstack(all_colors)
+    
+    # Save merged point cloud
+    merged_path = os.path.join(output_dir, merged_filename)
+    save_pointcloud(merged_points, merged_colors, merged_path)
+    print(f"Merged {len(merged_points)} points from {len(all_points)} files into {merged_filename}")
+
+
+def read_ply_file(ply_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Read a PLY file and return points and colors."""
+    try:
+        import trimesh
+        mesh = trimesh.load(ply_path)
+        if hasattr(mesh, 'vertices') and hasattr(mesh, 'visual') and hasattr(mesh.visual, 'vertex_colors'):
+            return mesh.vertices, mesh.visual.vertex_colors[:, :3]  # RGB only
+        else:
+            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3)
+    except Exception as e:
+        print(f"Error reading {ply_path}: {e}")
+        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3)
+
+
 def main():
     """Main function."""
     args = parse_args()
@@ -876,6 +927,11 @@ def main():
             )
             if not success:
                 continue
+        
+        # Merge all point clouds into a single file
+        print("Merging point clouds...")
+        merge_point_clouds(output_dir)
+    
     print("Tracking completed!")
 
 
