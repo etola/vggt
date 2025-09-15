@@ -54,6 +54,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--ref_image_id", type=int, default=None, help="Process only a specific reference image ID (if not provided, processes all images)")
     parser.add_argument("--max_tracks_vis", type=int, default=50, help="Maximum number of tracks to show in visualization")
+    parser.add_argument("--grid_spacing", type=int, default=50, help="Spacing between grid points for uniform sampling")
     
     return parser.parse_args()
 
@@ -300,8 +301,8 @@ def prepare_image_batch(reconstruction: ColmapReconstruction,
     return images_tensor, original_coords, all_image_ids
 
 
-def extract_features_from_resized_image(images_tensor: torch.Tensor, args) -> np.ndarray:
-    """Extract good features to track from the resized reference image."""
+def extract_features_from_resized_image(images_tensor: torch.Tensor, original_coords: torch.Tensor, args) -> np.ndarray:
+    """Extract good features to track from the resized reference image and add uniform grid points."""
     # Get the first image (reference image) from the batch
     ref_image_resized = images_tensor[0]  # (3, H, W)
     
@@ -312,9 +313,23 @@ def extract_features_from_resized_image(images_tensor: torch.Tensor, args) -> np
     ref_image_np = (ref_image_np * 255).astype(np.uint8)
     
     # Extract good features to track from resized reference image
-    query_points = get_good_features_to_track(ref_image_np, args.max_tracks_per_frame)
-    if len(query_points) == 0:
+    corner_points = get_good_features_to_track(ref_image_np, args.max_tracks_per_frame)
+    
+    # Generate uniform grid points (excluding padded regions)
+    grid_points = generate_uniform_grid_points(images_tensor, original_coords, args)
+    
+    # Combine corner points and grid points
+    all_query_points = []
+    if len(corner_points) > 0:
+        all_query_points.append(corner_points)
+    if len(grid_points) > 0:
+        all_query_points.append(grid_points)
+    
+    if len(all_query_points) == 0:
         raise ValueError("No features found in resized reference image")
+    
+    query_points = np.vstack(all_query_points)
+    print(f"Total query points: {len(query_points)} (corners: {len(corner_points)}, grid: {len(grid_points)})")
     
     return query_points
 
@@ -347,6 +362,43 @@ def get_good_features_to_track(image: np.ndarray, max_points: int = 1000) -> np.
     corners = corners.reshape(-1, 2)
     
     return corners
+
+
+def generate_uniform_grid_points(images_tensor: torch.Tensor, original_coords: torch.Tensor, args) -> np.ndarray:
+    """Generate uniform grid points across the image, excluding padded regions."""
+    # Get the original coordinates for the reference image (first image)
+    # original_coords format: [x1, y1, x2, y2, orig_width, orig_height]
+    ref_coords = original_coords[0].cpu().numpy()
+    ref_x1, ref_y1, ref_x2, ref_y2 = ref_coords[:4]
+    
+    # Get image dimensions
+    H, W = images_tensor.shape[2], images_tensor.shape[3]  # (B, C, H, W)
+    
+    # Use grid spacing from arguments
+    grid_spacing = args.grid_spacing
+    
+    # Add a small margin from the edges of the original image region to avoid edge effects
+    margin = 5  # Small margin relative to grid spacing
+    
+    # Generate grid points within the original image region (excluding padding)
+    # The original image region is defined by [ref_x1, ref_y1, ref_x2, ref_y2]
+    x_coords = np.arange(ref_x1 + margin, ref_x2 - margin, grid_spacing)
+    y_coords = np.arange(ref_y1 + margin, ref_y2 - margin, grid_spacing)
+    
+    # Create meshgrid
+    X, Y = np.meshgrid(x_coords, y_coords)
+    grid_points = np.column_stack([X.ravel(), Y.ravel()])
+    
+    # Ensure all points are within the original image region and image bounds
+    valid_mask = (
+        (grid_points[:, 0] >= ref_x1) & (grid_points[:, 0] < ref_x2) &
+        (grid_points[:, 1] >= ref_y1) & (grid_points[:, 1] < ref_y2) &
+        (grid_points[:, 0] >= 0) & (grid_points[:, 0] < W) &
+        (grid_points[:, 1] >= 0) & (grid_points[:, 1] < H)
+    )
+    grid_points = grid_points[valid_mask]
+    
+    return grid_points
 
 
 def run_vggt_tracking(model, images_data, query_points, device, dtype) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -723,7 +775,7 @@ def process_reference_view(reconstruction: ColmapReconstruction,
         )
         
         # Extract features from resized reference image
-        query_points = extract_features_from_resized_image(images_tensor, args)
+        query_points = extract_features_from_resized_image(images_tensor, original_coords, args)
         
         print(f"Processing {ref_image_name} with {len(query_points)} query points and {len(paired_ids)} paired frames")
         
