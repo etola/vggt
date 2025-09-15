@@ -1097,7 +1097,6 @@ def main():
     else:
         # Process all reference frames
         for ref_image_id in tqdm(reconstruction.get_all_image_ids(), desc="Processing frames"):
-            count += 1
             success, point_id_offset = process_reference_view(
                 reconstruction, ref_image_id, model, device, dtype, args, colmap_reconstruction, point_id_offset
             )
