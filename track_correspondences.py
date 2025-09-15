@@ -406,12 +406,12 @@ def filter_good_tracks(tracks: np.ndarray,
         avg_visibility = np.mean(track_vis)
         visible_frames = np.sum(track_vis > 0.5)
         
-        # For 2-image case, be more lenient with track length requirement
-        min_length = min(args.min_track_length, tracks.shape[0])
+        # Require tracks to be visible in at least 3 images for better triangulation
+        min_visible_frames = max(3, min(args.min_track_length, tracks.shape[0]))
         
         if (avg_confidence >= args.min_confidence and 
             avg_visibility >= args.min_visibility and 
-            visible_frames >= min_length):
+            visible_frames >= min_visible_frames):
             
             good_tracks.append(tracks[:, track_idx])
             good_visibilities.append(track_vis)
@@ -451,7 +451,7 @@ def triangulate_and_save_points(reconstruction: ColmapReconstruction,
         tracks_original_res[:, frame_idx, 0] = (tracks_original_res[:, frame_idx, 0] - x1) * scale_x
         tracks_original_res[:, frame_idx, 1] = (tracks_original_res[:, frame_idx, 1] - y1) * scale_y
     
-    # Filter out tracks that fall in padded regions (same as visualization)
+    # Filter out tracks that fall in padded regions for visible frames only
     valid_tracks_mask = np.ones(len(tracks_original_res), dtype=bool)
     
     for frame_idx in range(tracks_original_res.shape[1]):
@@ -463,8 +463,12 @@ def triangulate_and_save_points(reconstruction: ColmapReconstruction,
         in_bounds = ((frame_tracks[:, 0] >= 0) & (frame_tracks[:, 0] < orig_width) & 
                     (frame_tracks[:, 1] >= 0) & (frame_tracks[:, 1] < orig_height))
         
-        # Only keep tracks that are in bounds for this frame
-        valid_tracks_mask &= in_bounds
+        # Only check bounds for tracks that are visible in this frame
+        frame_visible = good_visibilities[:, frame_idx] > 0.5
+        visible_in_bounds = in_bounds | (~frame_visible)  # True if in bounds OR not visible
+        
+        # Only keep tracks that are in bounds for visible frames
+        valid_tracks_mask &= visible_in_bounds
     
     # Filter tracks and visibilities to only include valid ones
     if np.sum(valid_tracks_mask) == 0:
@@ -489,9 +493,9 @@ def triangulate_and_save_points(reconstruction: ColmapReconstruction,
         extrinsics.append(cam_from_world.matrix())
         intrinsics.append(K_orig)
     
-    # Triangulate 3D points
+    # Triangulate 3D points (require at least 3 views for better accuracy)
     points_3d, colors = triangulate_points(
-        tracks_original_res, good_visibilities, extrinsics, intrinsics, min_views=2
+        tracks_original_res, good_visibilities, extrinsics, intrinsics, min_views=3
     )
     
     # Save point cloud
@@ -547,7 +551,13 @@ def visualize_tracks(images_tensor: torch.Tensor,
         # Get visible tracks
         # tracks[track_idx, frame_idx, :] gives (x, y) for that track in that frame
         ref_points = tracks[both_visible, 0, :].astype(int)  # (N_visible_tracks, 2)
-        paired_points = tracks[both_visible, 1, :].astype(int)  # (N_visible_tracks, 2) - use frame 1 for paired image
+        paired_points = tracks[both_visible, i, :].astype(int)  # (N_visible_tracks, 2) - use frame i for paired image
+        
+        # Debug: print some track coordinates
+        print(f"DEBUG: Sample ref_points (first 3): {ref_points[:3]}")
+        print(f"DEBUG: Sample paired_points (first 3): {paired_points[:3]}")
+        print(f"DEBUG: Image shapes - ref: {ref_image_cropped.shape}, paired: {paired_image_cropped.shape}")
+        print(f"DEBUG: Original coords - ref: {ref_coords}, paired: {paired_coords}")
         
         # Filter tracks that are within the original image regions (not in padding)
         ref_in_bounds = ((ref_points[:, 0] >= ref_x1) & (ref_points[:, 0] < ref_x2) & 
@@ -564,30 +574,57 @@ def visualize_tracks(images_tensor: torch.Tensor,
         ref_points = ref_points[both_in_bounds]
         paired_points = paired_points[both_in_bounds]
         
-        # Limit number of tracks to show for better visualization
-        if len(ref_points) > max_tracks_to_show:
-            # Randomly sample tracks to show
-            np.random.seed(42)  # For reproducible results
-            indices = np.random.choice(len(ref_points), max_tracks_to_show, replace=False)
-            ref_points = ref_points[indices]
-            paired_points = paired_points[indices]
-        
-        # Convert to cropped image coordinates
-        ref_points_cropped = ref_points.copy()
+        # Convert from VGGT coordinates to cropped image coordinates
+        ref_points_cropped = ref_points.copy().astype(float)
         ref_points_cropped[:, 0] -= ref_x1  # Adjust x coordinates
         ref_points_cropped[:, 1] -= ref_y1  # Adjust y coordinates
         
-        paired_points_cropped = paired_points.copy()
+        paired_points_cropped = paired_points.copy().astype(float)
         paired_points_cropped[:, 0] -= paired_x1  # Adjust x coordinates
         paired_points_cropped[:, 1] -= paired_y1  # Adjust y coordinates
         
-        # Concatenate cropped images
-        concat_image = np.concatenate([ref_image_cropped, paired_image_cropped], axis=1)
+        print(f"DEBUG: After cropping - ref_points_cropped (first 3): {ref_points_cropped[:3]}")
+        print(f"DEBUG: After cropping - paired_points_cropped (first 3): {paired_points_cropped[:3]}")
         
-        # Offset paired points for concatenated image
-        ref_points_final = ref_points_cropped.copy()
-        paired_points_final = paired_points_cropped.copy()
-        paired_points_final[:, 0] += ref_image_cropped.shape[1]  # Offset by reference image width
+        # Limit number of tracks to show for better visualization
+        if len(ref_points_cropped) > max_tracks_to_show:
+            # Randomly sample tracks to show
+            np.random.seed(42)  # For reproducible results
+            indices = np.random.choice(len(ref_points_cropped), max_tracks_to_show, replace=False)
+            ref_points_cropped = ref_points_cropped[indices]
+            paired_points_cropped = paired_points_cropped[indices]
+        
+        
+        # Resize images to same height for concatenation
+        target_height = max(ref_image_cropped.shape[0], paired_image_cropped.shape[0])
+        
+        # Resize reference image
+        if ref_image_cropped.shape[0] != target_height:
+            ref_image_resized = cv2.resize(ref_image_cropped, 
+                                         (int(ref_image_cropped.shape[1] * target_height / ref_image_cropped.shape[0]), target_height))
+        else:
+            ref_image_resized = ref_image_cropped.copy()
+        
+        # Resize paired image
+        if paired_image_cropped.shape[0] != target_height:
+            paired_image_resized = cv2.resize(paired_image_cropped, 
+                                            (int(paired_image_cropped.shape[1] * target_height / paired_image_cropped.shape[0]), target_height))
+        else:
+            paired_image_resized = paired_image_cropped.copy()
+        
+        # Concatenate resized images
+        concat_image = np.concatenate([ref_image_resized, paired_image_resized], axis=1)
+        
+        # Scale points to match resized images
+        ref_scale_y = target_height / ref_image_cropped.shape[0]
+        paired_scale_y = target_height / paired_image_cropped.shape[0]
+        
+        ref_points_final = ref_points_cropped.copy().astype(float)
+        ref_points_final[:, 1] *= ref_scale_y  # Scale y coordinates
+        
+        paired_points_final = paired_points_cropped.copy().astype(float)
+        paired_points_final[:, 1] *= paired_scale_y  # Scale y coordinates
+        paired_points_final[:, 0] += ref_image_resized.shape[1]  # Offset by reference image width
         
         # Draw correspondence lines
         for ref_pt, paired_pt in zip(ref_points_final, paired_points_final):
